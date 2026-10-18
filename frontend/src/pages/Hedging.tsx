@@ -50,6 +50,7 @@ import {
   newTabId,
   saveHedgingState,
 } from '@/lib/hedging/storage'
+import { planUnderlyingTabs, type UnderlyingSource } from '@/lib/hedging/underlyingTab'
 import type {
   HedgingInstrument,
   HedgingState,
@@ -174,7 +175,7 @@ function HedgingTerminal({ apiKey, wsUrl }: { apiKey: string; wsUrl: string }) {
   /** Set once a deployment ran this session — the house basis reads it. */
   const deployedOnce = useRef(false)
   /** The tab waiting for its chain snapshot to auto-seed the panes. */
-  const pendingAutoSeed = useRef<{ tabId: string; underlying: string; expiry: string } | null>(null)
+  const pendingAutoSeed = useRef<{ tabId: string; underlying: string } | null>(null)
   /** Scheduler rows whose batch is firing right now (double-fire guard). */
   const firingSchedules = useRef(new Set<string>())
   const widerChain = useRef(new Map<string, Awaited<ReturnType<typeof scalpingApi.getStrikes>>>())
@@ -1008,18 +1009,20 @@ function HedgingTerminal({ apiKey, wsUrl }: { apiKey: string; wsUrl: string }) {
   }, [])
 
   // ── Auto-open on an underlying pick: spot + ATM CE/PE ──────────────────
-  // The pick arms the request; when the chain snapshot for THAT underlying
-  // and expiry lands, the untouched panes load the spot chart (pane 1), the
-  // ATM call (pane 2, left) and the ATM put (pane 3, right). A 'single'
-  // workspace becomes the top + 2-legs layout so the three charts have
-  // somewhere to land; anything the trader loaded by hand is never touched.
+  // The pick arms the request; when the chain snapshot for THAT tab lands
+  // (the query is keyed on the tab's own underlying + expiry, so the
+  // snapshot is inherently the one the top bar auto-picked), the untouched
+  // panes load the spot chart (pane 1), the ATM call (pane 2, left) and the
+  // ATM put (pane 3, right). A 'single' workspace becomes the top + 2-legs
+  // layout so the three charts have somewhere to land; anything the trader
+  // loaded by hand is never touched.
   const [autoSeed, setAutoSeed] = useState<WorkspaceAutoSeed | null>(null)
   useEffect(() => {
     if (!chain || !fno || !chain.atm_strike) return
     const pending = pendingAutoSeed.current
     if (!pending) return
     if (pending.tabId !== ctx.id) return
-    if (pending.underlying !== ctx.underlying || pending.expiry !== ctx.expiry) return
+    if (pending.underlying !== ctx.underlying) return
     const spot = {
       symbol: chain.underlying_symbol ?? ctx.underlying,
       exchange: chain.underlying_exchange ?? ctx.exchange,
@@ -1036,7 +1039,7 @@ function HedgingTerminal({ apiKey, wsUrl }: { apiKey: string; wsUrl: string }) {
     pendingAutoSeed.current = null
     autoSeedStamp.current += 1
     setAutoSeed({ stamp: autoSeedStamp.current, loads })
-  }, [chain, fno, ctx.id, ctx.underlying, ctx.expiry, ctx.exchange])
+  }, [chain, fno, ctx.id, ctx.underlying, ctx.exchange])
 
   const rowAction = useCallback(
     async (id: string, action: OrderSide) => {
@@ -1185,47 +1188,23 @@ function HedgingTerminal({ apiKey, wsUrl }: { apiKey: string; wsUrl: string }) {
     })
   }
 
-  /** A tab name no other tab holds: "NIFTY", then "NIFTY 2", … */
-  const uniqueTabName = (base: string, tabs: Array<{ name: string }>) => {
-    const taken = new Set(tabs.map((tab) => tab.name))
-    if (!taken.has(base)) return base
-    for (let i = 2; ; i++) if (!taken.has(`${base} ${i}`)) return `${base} ${i}`
-  }
-
-  /** A top-bar pick shows that market: a fresh workspace tab for it (or an
-   * untouched tab that already follows it), active immediately. The F&O tab
-   * is born with the spot + legs layout, and its chain snapshot auto-seeds
-   * the spot / ATM CE / ATM PE charts. */
-  const openUnderlyingWorkspace = (pick: UnderlyingPick) => {
-    const fnoMode = state.mode === 'fno'
-    pendingAutoSeed.current = fnoMode ? { tabId: '', underlying: pick.symbol, expiry: '' } : null
+  /** A top-bar pick opens that market in a brand-new workspace tab — every
+   * selection gets its own board with the spot + legs layout, never a
+   * re-dress of an older tab (whose layout the trader may have rebuilt).
+   * The F&O tab is born with the spot + legs layout, and its chain snapshot
+   * auto-seeds the spot / ATM CE / ATM PE charts. The one exception is the
+   * auto-pick that lands an exchange or mode switch: it adopts the pristine
+   * tab that switch just cleared instead of littering the strip. The strip
+   * arithmetic itself lives in lib/hedging/underlyingTab, under test. */
+  const openUnderlyingWorkspace = (pick: UnderlyingPick, source?: UnderlyingSource) => {
     setAutoSeed(null)
     setState((previous) => {
-      // Reuse a tab that already follows this market untouched — or any
-      // still-empty tab (an exchange switch clears the active one first, so
-      // the auto-pick lands there instead of littering the strip).
-      const reusable = previous.tabs.find(
-        (tab) =>
-          tab.options.length === 0 &&
-          tab.stocks.length === 0 &&
-          (tab.underlying === pick.symbol || tab.underlying === '') &&
-          (tab.exchange === pick.exchange || tab.underlying === '')
-      )
-      if (reusable) {
-        if (fnoMode)
-          pendingAutoSeed.current = { tabId: reusable.id, underlying: pick.symbol, expiry: '' }
-        return { ...previous, activeTabId: reusable.id }
-      }
-      const id = newTabId()
-      const tab = emptyTabContext(
-        id,
-        uniqueTabName(pick.symbol, previous.tabs),
-        fnoMode ? 'spotLegs' : 'single',
-        pick.exchange
-      )
-      tab.underlying = pick.symbol
-      if (fnoMode) pendingAutoSeed.current = { tabId: id, underlying: pick.symbol, expiry: '' }
-      return { ...previous, tabs: [...previous.tabs, tab], activeTabId: id }
+      const fnoMode = previous.mode === 'fno'
+      const plan = planUnderlyingTabs(previous, pick, fnoMode, source ?? 'user')
+      pendingAutoSeed.current = plan.autoSeedTabId
+        ? { tabId: plan.autoSeedTabId, underlying: pick.symbol }
+        : null
+      return { ...previous, tabs: plan.tabs, activeTabId: plan.activeTabId }
     })
   }
   const closeTab = (id: string) => {
@@ -1416,12 +1395,34 @@ function HedgingTerminal({ apiKey, wsUrl }: { apiKey: string; wsUrl: string }) {
         product={state.product}
         pnl={dayPnl}
         funds={funds}
-        onModeChange={(mode: Mode) =>
+        onModeChange={(mode: Mode) => {
           // The mode sets its product default: NRML carries F&O positions,
           // cash equity scalping is intraday (MIS). The active tab's market
           // resets — the other tabs keep whatever they were following.
           patch({ mode, product: mode === 'fno' ? 'NRML' : 'MIS' })
-        }
+          // The exchange vocabularies do not overlap: F&O trades NFO/BFO/
+          // MCX/CDS, equity NSE/BSE. A tab left from the other mode resets
+          // to its home exchange (search and expiries answer there); its
+          // rows stay, so switching back restores the book untouched.
+          setState((previous) => {
+            const active = previous.tabs.find((tab) => tab.id === previous.activeTabId)
+            if (!active) return previous
+            const valid =
+              mode === 'fno'
+                ? ['NFO', 'BFO', 'MCX', 'CDS'].includes(active.exchange)
+                : ['NSE', 'BSE'].includes(active.exchange)
+            if (valid) return previous
+            const exchange = mode === 'fno' ? 'NFO' : 'NSE'
+            return {
+              ...previous,
+              tabs: previous.tabs.map((tab) =>
+                tab.id === active.id
+                  ? { ...tab, exchange, underlying: '', expiry: '', futuresExpiry: '' }
+                  : tab
+              ),
+            }
+          })
+        }}
         onExchangeChange={(exchange) =>
           patchCtx({ exchange, underlying: '', expiry: '', futuresExpiry: '' })
         }

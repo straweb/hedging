@@ -1,6 +1,14 @@
 import { DRAWING_TOOL_ICONS, registeredDrawingTools } from 'openalgo-charts/draw'
 import { renderToStaticMarkup } from 'react-dom/server'
+import { ensureHostDrawingTools, HOST_DRAW_TOOL_METADATA } from './buySellImbalance'
 import { DRAW_GROUPS, drawToolIcon } from './drawTools'
+
+beforeAll(async () => {
+  // The Buy/Sell Imbalance study is registered host-side at runtime, not by
+  // the chart package itself — the catalogue lists it, so the comparison
+  // below needs that registration pulled in first.
+  await ensureHostDrawingTools()
+})
 
 describe('trading drawing catalogue', () => {
   const entries = DRAW_GROUPS.flatMap((group) => group.sections.flatMap((section) => section.tools))
@@ -20,9 +28,10 @@ describe('trading drawing catalogue', () => {
       expect(entry?.label, tool.id).toBe(tool.name)
       const container = document.createElement('div')
       container.innerHTML = renderToStaticMarkup(drawToolIcon(entry!.iconKey))
-      expect(container.querySelector('path')?.getAttribute('d'), tool.id).toBe(
-        DRAWING_TOOL_ICONS[tool.id]
-      )
+      // Engine tools carry the package's glyph; host-registered tools (the
+      // Buy/Sell Imbalance study) carry their own metadata path instead.
+      const expectedPath = DRAWING_TOOL_ICONS[tool.id] ?? HOST_DRAW_TOOL_METADATA[tool.id]?.path
+      expect(container.querySelector('path')?.getAttribute('d'), tool.id).toBe(expectedPath)
     }
   })
 

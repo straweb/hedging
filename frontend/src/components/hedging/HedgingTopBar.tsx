@@ -124,7 +124,12 @@ interface Props {
   funds: TopBarFunds | null
   onModeChange(mode: Mode): void
   onExchangeChange(exchange: string): void
-  onUnderlyingChange(pick: UnderlyingPick): void
+  /**
+   * A pick from the picker rows ('user') always opens a fresh workspace;
+   * the auto-pick that lands an exchange/mode switch on a valid underlying
+   * ('autopick') adopts the pristine tab that switch just cleared.
+   */
+  onUnderlyingChange(pick: UnderlyingPick, source?: 'user' | 'autopick'): void
   onExpiryChange(expiry: string): void
   onFuturesExpiryChange(expiry: string): void
   onCapitalChange(capital: number): void
@@ -189,7 +194,7 @@ export function HedgingTopBar(props: Props) {
     }
     const fallback =
       defaultsFor(props.exchange)[0] ?? (underlyingsQuery.data?.data ?? [])[0] ?? null
-    if (fallback) props.onUnderlyingChange(fallback)
+    if (fallback) props.onUnderlyingChange(fallback, 'autopick')
   }, [underlyingsQuery.data, underlyingsQuery.isLoading, props.exchange])
 
   useEffect(() => {
@@ -379,20 +384,23 @@ export function HedgingTopBar(props: Props) {
 
       {/* Option expiry (auto = nearest) — the OPT caption stays under the
           dropdown so the pair reads at a glance even after a date lands in
-          the trigger. */}
-      <div className="flex flex-col items-center gap-0.5">
-        <ExpirySelect
-          label="Opt"
-          underlying={props.underlying}
-          exchange={props.exchange}
-          value={props.expiry}
-          instrumenttype="options"
-          onChange={props.onExpiryChange}
-        />
-        <span className="text-[8px] leading-none font-semibold tracking-widest text-muted-foreground">
-          OPT
-        </span>
-      </div>
+          the trigger. Equity has no option chain, so the picker disappears
+          with the mode. */}
+      {fno && (
+        <div className="flex flex-col items-center gap-0.5">
+          <ExpirySelect
+            label="Opt"
+            underlying={props.underlying}
+            exchange={props.exchange}
+            value={props.expiry}
+            instrumenttype="options"
+            onChange={props.onExpiryChange}
+          />
+          <span className="text-[8px] leading-none font-semibold tracking-widest text-muted-foreground">
+            OPT
+          </span>
+        </div>
+      )}
 
       {/* Futures expiry (charts default to the SPOT index, front month one
           click away) with its FUT caption. */}
@@ -724,14 +732,17 @@ function ExpirySelect(props: {
   const [open, setOpen] = useState(false)
 
   // Nearest expiry by default (Spot first for the futures picker): the API
-  // returns them sorted, so index 0 is the front month. Re-selecting keeps
-  // the trader one click away from any other.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: auto-pick runs only when the expiry list arrives
+  // returns them sorted, so index 0 is the front month. The pick re-runs
+  // whenever the tab's own expiry changes too — a fresh workspace starts
+  // with none, and a choices-only watch would leave it empty whenever this
+  // underlying's list is already cached. A stale date (another underlying's)
+  // snaps to the front month.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: auto-pick runs when the list lands or the tab's expiry changes
   useEffect(() => {
     if (choices.length === 0) return
-    const wanted = props.value || (props.withSpot ? SPOT : '')
-    if (!choices.includes(wanted)) props.onChange(wanted || choices[0])
-  }, [choices])
+    if (props.value && choices.includes(props.value)) return
+    props.onChange(props.withSpot && !props.value ? SPOT : choices[0])
+  }, [choices, props.value])
 
   return (
     <Select
