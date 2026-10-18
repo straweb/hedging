@@ -96,6 +96,7 @@ import type { AlertFacts } from './alertMessage'
 import { fillAlertMessage } from './alertMessage'
 import { askToNotify } from './alertNotify'
 import { mergeAlertRuntime } from './alertRuntime'
+import { ensureHostDrawingTools } from './buySellImbalance'
 import { csvOptions, type DataExportOptions } from './chartDataExport'
 import { chartMotionOptions } from './chartMotion'
 import { CHART_READY, type ChartStateView, chartLoadFailed, chartNoData } from './chartState'
@@ -271,6 +272,7 @@ import {
 } from './drawingScope'
 import { DRAW_TOOL_METADATA } from './drawingToolMetadata'
 import { fmtPrice, money, priceDp, snapTick, tickSize } from './format'
+import { GHOST_INTERVALS, GhostCandles, isGhostInterval } from './ghostCandles'
 import { factsFor } from './instrumentFacts'
 import {
   type IntervalData,
@@ -282,6 +284,7 @@ import {
 } from './intervals'
 import {
   buildChartLegend,
+  buildGhostLegend,
   type LegendRun,
   legendHtml,
   legendToneStyle,
@@ -422,6 +425,8 @@ export interface TerminalCallbacks {
   onWorkspaceChange?(): void
   onReady(info: { intervalGroups: IntervalGroup[]; interval: string; chartType: string }): void
   onIntervalChange?(interval: string): void
+  /** The ghost-candle overlay's higher timeframe changed, or was taken off (null). */
+  onGhostIntervalChange?(interval: string | null): void
   /** The chart type changed from inside the terminal, such as an undo or redo. */
   onChartTypeChange?(chartType: string): void
   onContextMenu?(menu: TerminalContextMenu): void
@@ -1000,7 +1005,9 @@ const RIGHT_PAD_BARS = 4
  */
 const LEGEND_X = 12
 const LEGEND_Y = 8
-const LEGEND_SUB_Y = 25
+/** The ghost candle readout, on its own line under the chart's own. */
+const LEGEND_GHOST_Y = 25
+const LEGEND_SUB_Y = 40
 /** Space between two legend runs, in CSS px (the DOM renderer joins with ' '). */
 const LEGEND_GAP = 6
 
@@ -1034,6 +1041,12 @@ function nextPaint(): Promise<void> {
 }
 
 export class TradingTerminal {
+  /**
+   * The higher-timeframe ghost overlay. Created once, re-attached to every
+   * chart build; its state is the chosen interval, which `lsGet('ghost')`
+   * restores and `reconcileGhost` keeps strictly above the chart's own.
+   */
+  private readonly ghost = new GhostCandles()
   private alerts: AlertController | null = null
   private alertUi: AlertUi | null = null
   private offAlertFullscreen: (() => void) | null = null
@@ -1589,6 +1602,12 @@ export class TradingTerminal {
       }
     }
     if (!CHART_TYPES[this.ctype]) this.ctype = 'candlestick'
+    // The saved ghost choice is only recorded here. Whether it is still above
+    // the chart's interval is decided once `initialize` knows both, in
+    // `reconcileGhost` — a pane saved with a 5m overlay on a 5m chart must
+    // come back with the overlay off, not with two frames of the same size.
+    const savedGhost = this.lsGet('ghost')
+    if (isGhostInterval(savedGhost)) void this.ghost.setInterval(savedGhost)
   }
 
   /**
@@ -1773,7 +1792,12 @@ export class TradingTerminal {
     // History can finish during replay. Keep its live snapshot up to date,
     // but leave both displayed series and their timeline to the playhead.
     if (this.replayOwnsDisplay()) return
-    if (!this.price || !this.volume || !this.rawBars.length) return
+    if (!this.price || !this.volume) return
+    // The ghost overlay reads the same history, so it is rewritten here too —
+    // including when the history is empty, where a stale overlay would go on
+    // describing an instrument the chart no longer shows.
+    this.ghost.syncAll()
+    if (!this.rawBars.length) return
     // Always the raw bars. On a transformed chart type the chart forms the
     // elements from them, so a tick, history paging and replay all speak bars.
     this.price.setData(this.rawBars)
@@ -1871,6 +1895,9 @@ export class TradingTerminal {
     // `update` appends or replaces by time on its own, which is exactly the
     // append-or-replace the caller has already applied to `rawBars`.
     this.price.update(bar)
+    // The forming ghost candle is a fold of the same bars, so it takes the
+    // tick through the tail before either display path runs on.
+    this.ghost.foldLive(bar)
     if (this.transformed()) {
       this.setTransformedVolume(this.rawBars)
       this.shownCount = this.shownBars.length
@@ -1994,7 +2021,15 @@ export class TradingTerminal {
       this.legendEl.innerHTML = ''
       return
     }
-    this.legendEl.innerHTML = legendHtml(this.legendModel(bar))
+    // The ghost row renders only when it has a candle to describe: a just-
+    // loaded chart, an overlay whose history starts later than the chart's,
+    // and replay (whose future the overlay must not show) all leave it out.
+    const ghost = this.ghostLegendRuns(bar)
+    this.legendEl.innerHTML =
+      legendHtml(this.legendModel(bar)) +
+      (ghost
+        ? `<div style="margin-top:2px" title="Higher-timeframe ghost candles">${legendHtml(ghost)}</div>`
+        : '')
     // Comparison rows read the same bar as the readout above them.
     this.comparisons?.setReadout(bar?.time ?? null)
   }
@@ -2077,6 +2112,36 @@ export class TradingTerminal {
       )
     }
     return runs
+  }
+
+  /**
+   * The ghost row under the chart's own readout, or null when there is
+   * nothing to say: the overlay is off, no ghost candle covers the bar yet,
+   * or replay owns the display (the overlay must not read the future).
+   */
+  private ghostLegendRuns(bar: Bar | null): LegendRun[] | null {
+    const tf = this.ghost.interval()
+    if (!tf || !this.ghost.attached() || this.replayOwnsDisplay()) return null
+    const time = bar ? bar.time : (this.rawBars[this.rawBars.length - 1]?.time ?? null)
+    const candle = this.ghost.barAt(time)
+    if (!candle) return null
+    let prevClose: number | null = null
+    const bars = this.ghost.ghostBars()
+    for (let i = bars.length - 1; i >= 0; i--) {
+      if (bars[i].time === candle.time) {
+        prevClose = i > 0 ? bars[i - 1].close : null
+        break
+      }
+    }
+    const runs = buildGhostLegend({
+      interval: tf,
+      bar: candle,
+      prevClose,
+      fmt: (n) => this.fmt(n),
+      fmtVolume: compactVolume,
+      volumeHidden: !this.volumeOn,
+    })
+    return runs.length ? runs : null
   }
 
   /* ── order lines / position marker ────────────────────────────────────── */
@@ -2614,6 +2679,17 @@ export class TradingTerminal {
       priceFormat: { type: 'volume' },
     })
     this.volume.priceScale().setOptions({ marginTop: 0.82, marginBottom: 0 })
+    // The ghost overlay rides the same pane and the same price scale, added
+    // after the price series (its hollow outlines paint over the chart's own
+    // candles) and before volume (the histogram stays on top of it). Like
+    // every series here it belongs to this chart alone: the attach below
+    // remakes it for the new one, and the setPriceData further down fills it.
+    this.ghost.attach(
+      this.chart,
+      () => this.rawBars,
+      (interval, time) => this.ghostBucketStart(interval, time),
+      (p) => p.toFixed(this.dp())
+    )
     this.volumeMA = null
     this.displayedVolume = []
     // A rebuild makes a fresh series, so the preference has to be re-applied
@@ -3160,6 +3236,9 @@ export class TradingTerminal {
   private async attachDrawing(): Promise<void> {
     if (this.draw || !this.chart) return
     const chart = this.chart
+    // Host tools join the engine's registry before the controller reads it, so
+    // a Buy/Sell Imbalance drawing arms, persists and restores like a built-in.
+    await ensureHostDrawingTools()
     const {
       applyDrawingSettings,
       boundsOf,
@@ -6241,6 +6320,10 @@ export class TradingTerminal {
         this.cb.onReplayChange?.(state)
       },
     })
+    // The overlay aggregates the whole loaded history, and replay shows a
+    // prefix of it: a ghost candle left standing over the playhead would be a
+    // candle from the future, which is exactly what replay exists to hide.
+    this.ghost.setVisible(false)
     this.replayLoading = false
     this.showReplayMark(true)
     this.showTradeButtons(false)
@@ -6380,6 +6463,7 @@ export class TradingTerminal {
     }
     this.replay.stop()
     this.replay = null
+    this.ghost.setVisible(true)
     this.showReplayMark(false)
     this.showTradeButtons(true)
     if (!this.replayAutoScale) this.chart?.setAutoScale(false)
@@ -7172,6 +7256,7 @@ export class TradingTerminal {
     this.interval = iv
     // A preset range holds while its interval does; any other change ends it.
     if (this.rangeChoice) this.setActiveRange(null)
+    this.reconcileGhost()
     this.lsSet('interval', iv)
     this.cb.onIntervalChange?.(iv)
     if (this.link && this.chart) this.link.setInterval(this.chart, iv)
@@ -7194,6 +7279,87 @@ export class TradingTerminal {
       this.toast(`Using ${interval} bars for ${CHART_TYPES[v].label}`, '')
     } else if (this.rawBars.length) this.buildChart()
     return v
+  }
+
+  /* ── ghost candles: the higher timeframe drawn hollow over the chart's own ── */
+  /** The ghost overlay's higher timeframe, or null while it is off. */
+  ghostInterval(): string | null {
+    return this.ghost?.interval() ?? null
+  }
+
+  /** The higher timeframes the ghost selector offers. */
+  ghostIntervals(): readonly string[] {
+    return GHOST_INTERVALS
+  }
+
+  /**
+   * Choose the ghost overlay's higher timeframe, or null to take it off.
+   *
+   * The choice must sit strictly above the chart's own interval — a ghost 5m
+   * on a 5m chart would draw the same candle twice — and it persists per pane
+   * like the interval and the chart type do. The toolbar offers only valid
+   * choices; this re-checks because the chart's interval can move after the
+   * menu was drawn.
+   */
+  setGhostInterval(tf: string | null): void {
+    if (!this.ghost) return
+    const next = tf && isGhostInterval(tf) ? tf : null
+    if (next && !this.ghostAboveChart(next)) {
+      this.toast(`Ghost ${next} is not above the ${this.interval} chart`, 'err')
+      return
+    }
+    this.ghost.setInterval(next)
+    this.lsSet('ghost', next ?? '')
+    this.cb.onGhostIntervalChange?.(next)
+    // `GhostCandles.setInterval` re-aggregates on a live chart itself; the
+    // legend is the only thing left to move here, and it must move now rather
+    // than waiting for a tick that may be a closed session away.
+    this.refreshLegend()
+  }
+
+  /** Whether a ghost interval sits strictly above the chart's own. */
+  private ghostAboveChart(tf: string): boolean {
+    const gs = intervalSeconds(tf)
+    const cs = intervalSeconds(this.interval)
+    return gs !== null && cs !== null && gs > cs
+  }
+
+  /**
+   * Take the overlay off when the chart's interval rose to meet or pass it.
+   * Called wherever `this.interval` changes on a live pane; silent while the
+   * overlay is already off.
+   */
+  private reconcileGhost(): void {
+    // A terminal built without its fields (a test double) has no overlay.
+    const tf = this.ghost?.interval()
+    if (!tf) return
+    if (this.ghostAboveChart(tf)) return
+    this.ghost.setInterval(null)
+    this.lsSet('ghost', '')
+    this.cb.onGhostIntervalChange?.(null)
+  }
+
+  /**
+   * Session-aware start of the ghost bucket containing `time`. The calendar
+   * comes from the same source the live builder uses, so the overlay's day
+   * starts where the exchange's does. Without a calendar (a feed that never
+   * answered) buckets fall back to arithmetic from the Unix epoch, which is
+   * what the builder's anchor rule exists to avoid — but a ghost candle on a
+   * feed with no calendar is a hint, not a record.
+   */
+  private ghostBucketStart(interval: string, time: number): number {
+    const sec = intervalSeconds(interval)
+    if (!this.timeframes || !sec) {
+      return sec ? Math.floor(time / sec) * sec : time
+    }
+    return this.timeframes.bucketStart(
+      {
+        symbol: this.sym?.symbol ?? '',
+        exchange: this.sym?.exchange || this.exprLegExchange,
+        interval,
+      },
+      time
+    )
   }
   setProduct(p: string) {
     this.product = p
@@ -7521,12 +7687,29 @@ export class TradingTerminal {
       ctx.fillText(run.text, x, LEGEND_Y)
       x += ctx.measureText(run.text).width + LEGEND_GAP
     }
+    // The ghost row paints on its own line when the overlay is showing, and
+    // the lot line moves under it; with the overlay off the lot line keeps
+    // the position it has always had.
+    const ghost = this.ghostLegendRuns(this.legendBar)
+    let subY = LEGEND_SUB_Y
+    if (ghost) {
+      ctx.font = `500 12px ${family}`
+      let gx = LEGEND_X
+      for (const run of ghost) {
+        const tone = legendToneStyle(run.tone, foreground)
+        ctx.fillStyle = tone.color
+        ctx.globalAlpha = tone.alpha * (run.dim === true ? 0.5 : 1)
+        ctx.fillText(run.text, gx, LEGEND_GHOST_Y)
+        gx += ctx.measureText(run.text).width + LEGEND_GAP
+      }
+      subY = LEGEND_GHOST_Y + 15
+    }
     const sub = lotInfoText(this.sym, this.qty)
     if (sub) {
       ctx.font = `10px ${family}`
       ctx.fillStyle = foreground
       ctx.globalAlpha = 0.65
-      ctx.fillText(sub, LEGEND_X, LEGEND_SUB_Y)
+      ctx.fillText(sub, LEGEND_X, subY)
     }
     ctx.restore()
   }
@@ -7933,6 +8116,9 @@ export class TradingTerminal {
       if (interval) this.interval = interval
       else this.ctype = 'candlestick'
     }
+    // The interval is final here, so the saved ghost choice can be judged
+    // against it before anything reads the pair.
+    this.reconcileGhost()
     this.cb.onReady({ intervalGroups: groups, interval: this.interval, chartType: this.ctype })
 
     // one WebSocket for ticks + the account-level order stream.
@@ -8111,6 +8297,7 @@ export class TradingTerminal {
       /* already gone */
     }
     this.chart = null
+    this.ghost?.detach()
     this.ws = null
     this.screenshotExcluded.length = 0
     if (comparisonFailed) throw comparisonError

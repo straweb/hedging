@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -448,6 +448,17 @@ sdist = { url = "https://files.pythonhosted.org/packages/97/c4/64ebb159810a9840c
 wheels = [
     { url = "https://files.pythonhosted.org/packages/eb/5c/f15aa7a5da42fc85254f0150df7d377bb965b0c130c68f9701fba88e0df4/botocore-1.43.87-py3-none-any.whl", hash = "sha256:01e1e2255a8f4b959c19b210d74a5a916d13841c0344ceee15d8a3eaa4daa892", size = 15755750, upload-time = "2026-09-02T19:23:05.937Z" },
 ]
+
+[[package]]
+name = "breeze-connect"
+version = "1.0.69"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pandas" },
+    { name = "python-socketio", extra = ["client"] },
+    { name = "requests" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/09/12/02405a523a8fd0096eefc4cf29d568a4862e6715524d6765eaa6de39e29c/breeze_connect-1.0.69.tar.gz", hash = "sha256:458c129ca84a4302e8fff22236e3666e8a33225df4287c930bf7f8de18f8fc1d", size = 66955, upload-time = "2026-04-14T11:13:24.993Z" }
 
 [[package]]
 name = "cachecontrol"
@@ -2952,6 +2963,7 @@ dependencies = [
     { name = "bcrypt" },
     { name = "bidict" },
     { name = "blinker" },
+    { name = "breeze-connect" },
     { name = "cachetools" },
     { name = "certifi" },
     { name = "cffi" },
@@ -3128,6 +3140,7 @@ requires-dist = [
     { name = "bcrypt", specifier = "==5.0.0" },
     { name = "bidict", specifier = "==0.24.1" },
     { name = "blinker", specifier = "==1.9.0" },
+    { name = "breeze-connect", specifier = "==1.0.69" },
     { name = "cachetools", specifier = "==7.1.7" },
     { name = "certifi", specifier = "==2026.7.22" },
     { name = "cffi", specifier = "==2.1.1" },
@@ -4178,6 +4191,12 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/06/5e/87d6b547c87c6d64f4a05f5bfaf6f42e9b786561216434290fdaa83f8667/python_socketio-5.16.4.tar.gz", hash = "sha256:f7fa4a43cc8e687930b5c6e44d6e2efc2071eca4bef49b8bb3dc0827f7f92235", size = 128140, upload-time = "2026-08-06T23:11:21.346Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/94/d9/463feca73ec119a135d90c9f40c0172b4758150b5ed442f0ca1e8fed807a/python_socketio-5.16.4-py3-none-any.whl", hash = "sha256:0eb9c7687e7fbf59e60d714fd62afba77dfaf8ef8a06a0bff05a86c351accc2f", size = 82098, upload-time = "2026-08-06T23:11:19.851Z" },
+]
+
+[package.optional-dependencies]
+client = [
+    { name = "requests" },
+    { name = "websocket-client" },
 ]
 
 [[package]]

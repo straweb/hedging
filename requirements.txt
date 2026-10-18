@@ -10,6 +10,7 @@ attrs==24.2.0
 bcrypt==5.0.0
 bidict==0.24.1
 blinker==1.9.0
+breeze-connect==1.0.69
 cachetools==7.1.7
 certifi==2026.7.22
 cffi==2.1.1

@@ -1,5 +1,6 @@
 /** The host owns grouping; names and glyphs come from the pinned chart package. */
 import type { ReactNode } from 'react'
+import { HOST_DRAW_TOOL_METADATA } from './buySellImbalance'
 import { RAIL_TOOL_PATHS } from './chromeIcons'
 import { DRAW_TOOL_METADATA } from './drawingToolMetadata'
 import { toolGlyph } from './glyphs'
@@ -17,8 +18,13 @@ export interface DrawGroupDef {
   sections: { head?: string; tools: DrawToolDef[] }[]
 }
 
+function toolName(id: string): string {
+  return DRAW_TOOL_METADATA[id]?.name ?? HOST_DRAW_TOOL_METADATA[id]?.name ?? id
+}
+
 function tools(...ids: string[]): DrawToolDef[] {
-  return ids.map((id) => ({ id, label: DRAW_TOOL_METADATA[id].name, iconKey: id }))
+  return ids.map((id) => ({ id, label: toolName(id), iconKey: id }))
+  // return ids.map((id) => ({ id, label: DRAW_TOOL_METADATA[id].name, iconKey: id }))
 }
 
 export const DRAW_GROUPS: DrawGroupDef[] = [
@@ -168,7 +174,7 @@ export const DRAW_GROUPS: DrawGroupDef[] = [
     iconKey: 'fixed-range-volume-profile',
     sections: [
       {
-        tools: tools('anchored-vwap', 'fixed-range-volume-profile'),
+        tools: tools('anchored-vwap', 'fixed-range-volume-profile', 'buy-sell-imbalance'),
       },
     ],
   },
@@ -226,6 +232,10 @@ export const DRAW_GROUPS: DrawGroupDef[] = [
  * same grid as the tools rather than hand-drawn beside them.
  */
 export function drawToolIcon(iconKey: string, size?: number, className?: string): ReactNode {
-  const path = DRAW_TOOL_METADATA[iconKey]?.path ?? RAIL_TOOL_PATHS[iconKey]
+  // const path = DRAW_TOOL_METADATA[iconKey]?.path ?? RAIL_TOOL_PATHS[iconKey]
+  const path =
+    DRAW_TOOL_METADATA[iconKey]?.path ??
+    HOST_DRAW_TOOL_METADATA[iconKey]?.path ??
+    RAIL_TOOL_PATHS[iconKey]
   return path ? toolGlyph(path, iconKey, size, className) : null
 }

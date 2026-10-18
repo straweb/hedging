@@ -51,6 +51,16 @@ export const LAYOUTS: LayoutPreset[] = [
     cells: ['a', 'b', 'c'],
   },
   {
+    // The hedging terminal's auto-open shape: the spot chart across the top,
+    // the ATM call and put side by side beneath it.
+    id: 'spotLegs',
+    label: 'Top + 2 legs',
+    cols: '1fr 1fr',
+    rows: '1fr 1fr',
+    areas: '"a a" "b c"',
+    cells: ['a', 'b', 'c'],
+  },
+  {
     id: 'grid4',
     label: '2 × 2',
     cols: '1fr 1fr',

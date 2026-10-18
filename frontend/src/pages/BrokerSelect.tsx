@@ -35,6 +35,7 @@ const allBrokers = [
   { id: 'hdfcsecurities', name: 'HDFC Securities', authType: 'oauth' },
   { id: 'hdfcsky', name: 'HDFC Sky', authType: 'oauth' },
   { id: 'ibulls', name: 'Ibulls', authType: 'totp' },
+  { id: 'icici', name: 'ICICI Direct', authType: 'oauth' },
   { id: 'iifl', name: 'IIFL', authType: 'totp' },
   { id: 'iiflcapital', name: 'IIFL Capital', authType: 'oauth' },
   { id: 'jainamxts', name: 'JainamXts', authType: 'totp' },
@@ -216,6 +217,13 @@ export default function BrokerSelect() {
         loginUrl = `https://developer.hdfcsky.com/oapi/v1/login?api_key=${broker_api_key}`
         break
 
+      case 'icici':
+        // ICICI Direct Breeze hosted login; the backend builds the login URL
+        // from the configured app key and returns the api_session on the
+        // registered /icici/callback redirect.
+        loginUrl = `/icici/callback`
+        break
+      
       case 'paytm':
         loginUrl = `https://login.paytmmoney.com/merchant-login?apiKey=${broker_api_key}&state={default}`
         break

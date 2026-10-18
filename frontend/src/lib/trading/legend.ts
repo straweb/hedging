@@ -145,6 +145,64 @@ export function buildChartLegend(input: LegendInput): LegendRun[] {
   return runs
 }
 
+/**
+ * The ghost candle's own readout: the row under the chart's OHLC line that
+ * describes the higher-timeframe candle the hovered bar falls inside.
+ *
+ * The shape mirrors the main line's bar section — interval label, O/H/L/C/V,
+ * the candle's own change against the ghost candle before it — so the eye that
+ * learned the first row reads the second one for free. Everything describes
+ * one ghost candle: the 5m row under a 09:17 hover reports the 09:15 5m
+ * candle, whatever the 1m bar under the pointer is doing.
+ */
+export interface GhostLegendBar {
+  open: number
+  high: number
+  low: number
+  close: number
+  volume?: number
+}
+
+export interface GhostLegendInput {
+  /** The ghost overlay's interval token (e.g. `5m`), shown as the row label. */
+  interval: string
+  bar: GhostLegendBar | null
+  /** Close of the ghost candle before `bar`; null shows no change at all. */
+  prevClose: number | null
+  /** Price formatter bound to the instrument tick. */
+  fmt(value: number): string
+  /** Compact volume formatter (e.g. 1.20M). */
+  fmtVolume(value: number): string
+  /** The chart's volume bars are switched off, so this row says the same. */
+  volumeHidden?: boolean
+}
+
+export function buildGhostLegend(input: GhostLegendInput): LegendRun[] {
+  if (!input.bar) return []
+  const runs: LegendRun[] = [{ text: input.interval, tone: 'meta' }]
+  const bar = input.bar
+  const tone = bar.close >= bar.open ? 'up' : 'down'
+  runs.push({
+    text:
+      `O ${input.fmt(bar.open)} H ${input.fmt(bar.high)} ` +
+      `L ${input.fmt(bar.low)} C ${input.fmt(bar.close)}`,
+    tone,
+  })
+  if (typeof bar.volume === 'number' && Number.isFinite(bar.volume) && bar.volume >= 0) {
+    runs.push({ text: `V ${input.fmtVolume(bar.volume)}`, tone, dim: input.volumeHidden === true })
+  }
+  if (input.prevClose != null && input.prevClose !== 0) {
+    const change = bar.close - input.prevClose
+    const pct = (change / input.prevClose) * 100
+    const sign = change >= 0 ? '+' : '-'
+    runs.push({
+      text: `${sign}${input.fmt(Math.abs(change))} (${sign}${Math.abs(pct).toFixed(2)}%)`,
+      tone: change >= 0 ? 'up' : 'down',
+    })
+  }
+  return runs
+}
+
 /** The second legend line: what one lot of quantity actually buys. */
 export function lotInfoText(
   v: { lots: boolean; lotsize: number; freezeQty: number; quoteOnly: boolean } | null,
@@ -204,9 +262,16 @@ export function legendHtml(runs: readonly LegendRun[]): string {
           `>${esc(run.text)}</span>`
         )
       }
-      const attr = style ? ` style="${style}"` : ''
+      const attr = [
+        style,
+        // A plain run can be dimmed too: the ghost row's volume readout follows
+        // the chart's volume switch without being a switch of its own.
+        run.dim === true ? 'opacity:.5' : '',
+      ]
+        .filter(Boolean)
+        .join(';')
       const tag = run.tone === 'symbol' ? 'b' : 'span'
-      return `<${tag}${attr}>${esc(run.text)}</${tag}>`
+      return `<${tag}${attr ? ` style="${attr}"` : ''}>${esc(run.text)}</${tag}>`
     })
     .join(' ')
 }

@@ -9,6 +9,7 @@
  * once the tier is in hand, so by the time any of these runs it is.
  */
 import type { Drawing, DrawingController, DrawingPatch, FibLevel } from 'openalgo-charts/draw'
+import { HOST_DRAW_TOOL_METADATA } from './buySellImbalance'
 import { DRAW_TOOL_METADATA } from './drawingToolMetadata'
 
 /**
@@ -42,7 +43,10 @@ export const ERASER_TOOL = 'eraser'
 /** The tool's name as the rail lists it, else its id spaced out. */
 export function drawingToolName(tool: string): string {
   return (
-    DRAW_TOOL_METADATA[tool]?.name ?? tool.replace(/-/g, ' ').replace(/^./, (c) => c.toUpperCase())
+    DRAW_TOOL_METADATA[tool]?.name ??
+    HOST_DRAW_TOOL_METADATA[tool]?.name ??
+    tool.replace(/-/g, ' ').replace(/^./, (c) => c.toUpperCase())
+    // DRAW_TOOL_METADATA[tool]?.name ?? tool.replace(/-/g, ' ').replace(/^./, (c) => c.toUpperCase())
   )
 }
 

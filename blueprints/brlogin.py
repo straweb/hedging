@@ -43,7 +43,7 @@ def broker_callback(broker, para=None):
     logger.info(f"Session has user key: {'user' in session}")
 
     # Special handling for brokers that come from external auth and might lose session
-    if broker in ("compositedge", "rmoney", "iiflcapital") and "user" not in session:
+    if broker in ("compositedge", "rmoney", "iiflcapital", "icici") and "user" not in session:
         # Session will be established after successful auth token validation
         logger.info(f"{broker} callback without session - will establish session after auth")
     # Special handling for mstock POST - check session but provide better error instead of redirect
@@ -280,14 +280,32 @@ def broker_callback(broker, para=None):
         forward_url = "broker.html"
 
     elif broker == "icici":
-        full_url = request.full_path
-        from utils.url_redaction import redact_url_credentials
-
-        logger.debug(f"ICICI broker - Full URL: {redact_url_credentials(full_url)}")
         code = request.args.get("apisession")
-        logger.debug("ICICI broker - apisession present: %s", bool(code))
-        auth_token, error_message = auth_function(code)
-        forward_url = "broker.html"
+        if code:
+            full_url = request.full_path
+            from utils.url_redaction import redact_url_credentials
+
+            logger.debug(f"ICICI broker - Full URL: {redact_url_credentials(full_url)}")
+            logger.debug("ICICI broker - apisession present: %s", bool(code))
+            auth_token, error_message = auth_function(code)
+            forward_url = "broker.html"
+        else:
+            # First leg of the Breeze login: send the browser to ICICI's
+            # login page; it comes back to /icici/callback?apisession=...
+            api_key = get_broker_api_key()
+            if not api_key:
+                return jsonify(error="BROKER_API_KEY is not configured for ICICI Direct"), 400
+            from broker.icici.api.baseurl import get_login_url
+
+            return redirect(get_login_url(api_key))
+        # full_url = request.full_path
+        # from utils.url_redaction import redact_url_credentials
+
+        # logger.debug(f"ICICI broker - Full URL: {redact_url_credentials(full_url)}")
+        # code = request.args.get("apisession")
+        # logger.debug("ICICI broker - apisession present: %s", bool(code))
+        # auth_token, error_message = auth_function(code)
+        # forward_url = "broker.html"
 
     elif broker == "ibulls":
         code = "ibulls"

@@ -38,7 +38,9 @@ import {
   isBoxChartType,
 } from '@/lib/trading/chartTypes'
 import { MOD_KEY } from '@/lib/trading/drawingKeys'
+import { GHOST_INTERVALS } from '@/lib/trading/ghostCandles'
 import { ChromeIcon, chromeStroke, lineStroke24 } from '@/lib/trading/glyphs'
+import { intervalSeconds } from '@/lib/trading/intervals'
 import { chartTimeframePreferences } from '@/lib/trading/timeframePreferences'
 import { TimeframeMenu } from './TimeframeMenu'
 
@@ -177,10 +179,41 @@ function ledClass(state: string): string {
   return 'bg-amber-500'
 }
 
+/**
+ * A pane-docked two-button trade cluster for symbols the chart itself cannot
+ * trade. An index is quote-only — the engine's inline Buy/Sell panel never
+ * mounts on it — so the hedging terminal docks its own Deploy CE / Deploy PE
+ * pair at the price-scale edge instead, wired to the side deploys.
+ */
+export interface PaneQuickTrade {
+  primaryLabel: string
+  secondaryLabel: string
+  primaryTone: 'buy' | 'sell'
+  secondaryTone: 'buy' | 'sell'
+  onPrimary(): void
+  onSecondary(): void
+}
+
 interface Props {
   /** Undefined keeps the local toolbar; null waits for the shared host. */
   toolbarHost?: HTMLElement | null
   focused?: boolean
+  /**
+   * Icon-only toolbar: every text label hidden, the quantity field dropped,
+   * the row one notch shorter and its horizontal overflow scrollable with the
+   * theme's thin scrollbar. For dense grids — a 2×2 of terminals on a laptop
+   * — where the labelled row overflows and, with the scrollbar suppressed,
+   * the clipped half was unreachable.
+   */
+  /**
+   * Icon-only toolbar: every text label hidden, the quantity field dropped,
+   * and the row pulled out of the pane's flow into a floating band over the
+   * plot — the draw rail's presentation. A dense grid's charts get the whole
+   * pane; controls hover over the top edge instead of pushing the plot down.
+   */
+  toolbarCompact?: boolean
+  /** Docked Deploy CE/PE (or Buy/Sell) pair for quote-only panes. */
+  quickTrade?: PaneQuickTrade
   paneLabel?: string
   /** Stable pane id — namespaces the pane's persisted symbol/interval/type. */
   paneId: string
@@ -277,6 +310,9 @@ export function ChartPane({
   wsUrl,
   initialWorkspacePane,
   transitionLocked = false,
+  /** Icon-only toolbar: labels hidden, floating band, a real (thin) scrollbar. */
+  toolbarCompact = false,
+  quickTrade,
   onInitialized,
   onInitializationError,
   onWorkspaceChange,
@@ -374,6 +410,8 @@ export function ChartPane({
   }, [ready])
   const [intervalGroups, setIntervalGroups] = useState<IntervalGroup[]>([])
   const [interval, setIntervalState] = useState('5m')
+  /** The ghost overlay's higher timeframe; null while the overlay is off. */
+  const [ghostTf, setGhostTf] = useState<string | null>(null)
   const [chartType, setChartTypeState] = useState('candlestick')
   // The type on screen now, for a reply that lands after the type has moved on.
   const chartTypeRef = useRef(chartType)
@@ -541,6 +579,10 @@ export function ChartPane({
         setIntervalState(iv)
         intervalCbRef.current?.(paneId, iv)
       },
+      onGhostIntervalChange: (tf) => {
+        if (!current) return
+        setGhostTf(tf)
+      },
       onWsState: (s) => current && setWsState(s),
       onSymbolLoaded: (view) => {
         if (!current) return
@@ -642,6 +684,7 @@ export function ChartPane({
             noteHistory(stats)
             setGrid(owner.gridState())
             setVolumeOn(owner.volumeVisible())
+            setGhostTf(owner.ghostInterval?.() ?? null)
             setReady(true)
             initializedCbRef.current?.(paneId, owner)
           })
@@ -698,6 +741,11 @@ export function ChartPane({
   const changeChartType = (v: string) => {
     onBeforeSourceChange?.()
     setChartTypeState(terminalRef.current?.chooseChartType(v) ?? v)
+  }
+  /** The ghost overlay's higher timeframe; null takes it off the chart. */
+  const changeGhostInterval = (tf: string | null) => {
+    onBeforeSourceChange?.()
+    terminalRef.current?.setGhostInterval(tf)
   }
   /** Write the CSV. Throws with a sentence the download dialog shows. */
   const downloadCsv = (options: DataExportOptions) => {
@@ -1064,8 +1112,10 @@ export function ChartPane({
         // The frame says which chart the shared toolbar drives, so it only
         // speaks when there is more than one chart: the accent edge plus a
         // soft outer ring, which holds on a near-white accent in dark mode as
-        // well as on the violet. A lone chart keeps its quiet border.
-        toolbarHost !== undefined &&
+        // well as on the violet. A lone chart keeps its quiet border. Compact
+        // grids (the hedging terminal) have no shared row to point back at —
+        // the border is the only thing saying which chart is selected.
+        (toolbarHost !== undefined || toolbarCompact) &&
           focused &&
           '[&:not(:only-child)]:border-primary/80 [&:not(:only-child)]:ring-2 [&:not(:only-child)]:ring-primary/25'
       )}
@@ -1095,13 +1145,30 @@ export function ChartPane({
           role="toolbar"
           aria-label="Chart controls"
           data-toolbar-pane={paneId}
+          data-toolbar-compact={toolbarCompact || undefined}
           inert={transitionLocked ? true : undefined}
           // Borderless controls on one band. In the page's row the band and
           // its hairline belong to the page, which also holds the controls
           // either side of this one; on its own (full screen) it carries them.
+          // In a compact grid the band leaves the flow entirely: it floats
+          // over the plot's top edge — the draw rail's presentation — so the
+          // chart keeps the whole pane and can never end up sharing its
+          // height with the controls row.
           className={cn(
-            'flex h-10 min-w-0 flex-nowrap items-center gap-0.5 no-scrollbar overflow-x-auto px-1',
-            (toolbarHost === undefined || fullscreen) && 'oa-terminal-band border-b'
+            'flex min-w-0 flex-1 flex-nowrap items-center gap-0.5 overflow-x-auto px-1',
+          //   toolbarCompact ? 'h-10 scrollbar-thin' : 'no-scrollbar h-10',
+          //   (toolbarHost === undefined || fullscreen) && 'oa-terminal-band border-b'
+          // )}
+          // className={cn(
+          //   'flex h-10 min-w-0 flex-nowrap items-center gap-0.5 no-scrollbar overflow-x-auto px-1',
+          //   (toolbarHost === undefined || fullscreen) && 'oa-terminal-band border-b'
+          // )}
+          toolbarCompact
+              ? 'absolute inset-x-2 top-2 z-20 h-8 rounded-lg border bg-popover/92 shadow-md backdrop-blur scrollbar-thin'
+              : 'no-scrollbar h-10',
+            !toolbarCompact &&
+              (toolbarHost === undefined || fullscreen) &&
+              'oa-terminal-band border-b'
           )}
         >
           {/* Symbol: a search glyph in a soft square, then the instrument in
@@ -1124,7 +1191,14 @@ export function ChartPane({
               <span className="flex h-6 w-6 items-center justify-center rounded-md bg-foreground/[0.07] text-muted-foreground">
                 <ChromeIcon id="search" size={14} />
               </span>
-              <span className="max-w-[10rem] truncate text-sm font-semibold tracking-tight">
+              <span
+                className={cn(
+                  'truncate text-sm font-semibold tracking-tight',
+                  toolbarCompact ? 'max-w-[7rem]' : 'max-w-[10rem]'
+                )}
+              >
+              {/* </span>
+              <span className="max-w-[10rem] truncate text-sm font-semibold tracking-tight"> */}
                 {sym?.symbol ?? 'Search symbol'}
               </span>
               {sym && (
@@ -1183,6 +1257,64 @@ export function ChartPane({
             </DropdownMenuContent>
           </DropdownMenu>
 
+          {/* Ghost candles: the higher timeframe drawn hollow over this chart's
+            own. Off by default; the choices at or below the chart's interval
+            are greyed rather than hidden, so the menu explains why they are
+            not available instead of silently shrinking. */}
+          <DropdownMenu>
+            <Tip
+              tip={{
+                title: 'Ghost candles',
+                sub: ghostTf
+                  ? `Higher-timeframe hollow candles: ${ghostTf}`
+                  : 'Overlay a higher timeframe as hollow candles',
+              }}
+            >
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  className={cn(TB_BTN, 'gap-1 px-1.5')}
+                  aria-label={`Ghost candles: ${ghostTf ?? 'off'}`}
+                >
+                  <span className="h-4 w-4">{chartTypeIcon('chart-hollow-candle')}</span>
+                  {ghostTf && (
+                    <span className="text-[10px] font-semibold leading-none">{ghostTf}</span>
+                  )}
+                  <MenuChevron />
+                </button>
+              </DropdownMenuTrigger>
+            </Tip>
+            <DropdownMenuContent container={menuHost} align="start" className="w-52">
+              <DropdownMenuItem
+                onSelect={() => changeGhostInterval(null)}
+                className="gap-2 text-sm"
+              >
+                <span className="h-4 w-4" />
+                Off
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              {GHOST_INTERVALS.map((tf) => {
+                // Strictly above the chart's own frame, and both intraday: a
+                // daily chart has no intraday frame above it to overlay.
+                const gs = intervalSeconds(tf)
+                const cs = intervalSeconds(interval)
+                const above = gs !== null && cs !== null && gs > cs
+                return (
+                  <DropdownMenuItem
+                    key={tf}
+                    disabled={!above}
+                    onSelect={() => changeGhostInterval(tf)}
+                    className={cn('gap-2 text-sm', tf === ghostTf && 'text-primary')}
+                    title={above ? undefined : `Not above the ${interval} chart`}
+                  >
+                    <span className="h-4 w-4" />
+                    {tf} ghost candles
+                  </DropdownMenuItem>
+                )
+              })}
+            </DropdownMenuContent>
+          </DropdownMenu>
+
           {/* Box settings, beside the type they belong to and only while it is
             on screen: the size, how it is measured, and the reversal are what
             a trader changes while reading boxes, so they get a click rather
@@ -1232,7 +1364,10 @@ export function ChartPane({
             </Tip>
           )}
 
-          {/* Quantity: the one field in the row keeps a fill, so it reads as editable. */}
+          {/* Quantity: the one field in the row keeps a fill, so it reads as editable.
+            Compact grids drop it: the dense layout trades from the side panels
+            and the dock, and the field was the widest fixed item in the row. */}
+          {!toolbarCompact && (
           <div className="flex shrink-0 items-center gap-1.5 pl-1">
             <label
               className="whitespace-nowrap text-[11px] font-medium text-muted-foreground"
@@ -1249,6 +1384,7 @@ export function ChartPane({
               className="h-7 w-16 rounded-md border-transparent bg-foreground/[0.06] px-2 text-[13px] font-medium tabular-nums shadow-none hover:bg-foreground/[0.09] focus-visible:border-ring dark:bg-foreground/[0.07]"
             />
           </div>
+          )}
 
           <ToolbarDivider />
 
@@ -1266,7 +1402,7 @@ export function ChartPane({
               }}
             >
               <IndicatorIcon className="h-4 w-4" />
-              <span className={TB_LABEL_2XL}>Indicators</span>
+              <span className={toolbarCompact ? 'hidden' : TB_LABEL_2XL}>Indicators</span>
               {indicators.length > 0 && <span className={TB_COUNT}>{indicators.length}</span>}
             </button>
           </Tip>
@@ -1279,7 +1415,7 @@ export function ChartPane({
               onClick={() => void terminalRef.current?.openAlerts()}
             >
               <ChromeIcon id="bell" />
-              <span className={TB_LABEL_WIDE}>Alerts</span>
+              <span className={toolbarCompact ? 'hidden' : TB_LABEL_WIDE}>Alerts</span>
             </button>
           </Tip>
 
@@ -1339,7 +1475,7 @@ export function ChartPane({
               }}
             >
               <ChromeIcon id="replay" />
-              <span className={TB_LABEL_2XL}>Replay</span>
+              <span className={toolbarCompact ? 'hidden' : TB_LABEL_2XL}>Replay</span>
             </button>
           </Tip>
 
@@ -1635,12 +1771,42 @@ export function ChartPane({
             />
           </Suspense>
         )}
-        <div className="pointer-events-none absolute left-3 top-1.5 z-10 flex flex-col gap-0.5">
+        {/* The legend sits at the plot's foot in compact grids: the controls
+            now float over the top edge, so a top-left legend would be pinned
+            under the band. */}
+        <div
+          className={cn(
+            'pointer-events-none absolute left-3 z-10 flex flex-col gap-0.5',
+            toolbarCompact ? 'bottom-2' : 'top-1.5'
+          )}
+        >
           <div ref={legendRef} className="text-xs font-medium text-foreground" />
           {sym && lotInfoText(sym, qty) && (
             <span className="text-[10px] text-muted-foreground">{lotInfoText(sym, qty)}</span>
           )}
         </div>
+        {/* Quote-only instruments cannot trade from the chart — the engine
+            never mounts its Buy/Sell panel on them. When the page supplies a
+            quick-trade pair (the hedging terminal's Deploy CE/PE on an index
+            chart), dock it at the price-scale edge where the last-price tag
+            lives, so the chart still answers with one press. */}
+        {quickTrade && sym && (
+          <div
+            data-workspace-control
+            className="pointer-events-auto absolute top-1/2 right-1.5 z-20 flex -translate-y-1/2 flex-col gap-1"
+          >
+            <QuickTradeButton
+              label={quickTrade.primaryLabel}
+              tone={quickTrade.primaryTone}
+              onClick={quickTrade.onPrimary}
+            />
+            <QuickTradeButton
+              label={quickTrade.secondaryLabel}
+              tone={quickTrade.secondaryTone}
+              onClick={quickTrade.onSecondary}
+            />
+          </div>
+        )}
         {/* The armed drawing tool's glyph follows the pointer: the terminal
             sets --tool-cursor while a tool is armed and clears it after. */}
         <div ref={chartRef} className="absolute inset-0 [cursor:var(--tool-cursor,auto)]" />
@@ -2301,5 +2467,23 @@ export function ChartPane({
         </Suspense>
       )}
     </section>
+  )
+}
+
+/** One docked quick-trade button: the dock's palette at the chart's edge. */
+function QuickTradeButton(props: { label: string; tone: 'buy' | 'sell'; onClick(): void }) {
+  return (
+    <button
+      type="button"
+      onClick={props.onClick}
+      className={cn(
+        'h-6 min-w-[4.5rem] rounded-md border px-1.5 text-[9px] font-bold tracking-wide text-white shadow-md backdrop-blur transition-colors',
+        props.tone === 'buy'
+          ? 'border-emerald-500/60 bg-emerald-600/90 hover:bg-emerald-500'
+          : 'border-red-500/60 bg-red-600/90 hover:bg-red-500'
+      )}
+    >
+      {props.label}
+    </button>
   )
 }

@@ -63,6 +63,9 @@ from broker.iiflcapital.streaming.iiflcapital_adapter import IiflcapitalWebSocke
 # Import the indmoney_adapter
 from broker.indmoney.streaming.indmoney_adapter import IndmoneyWebSocketAdapter
 
+# Import the icici_adapter
+from broker.icici.streaming.icici_adapter import IciciWebSocketAdapter
+
 # Import the fivepaisaxts_adapter
 from broker.jainamxts.streaming.jainamxts_adapter import JainamXTSWebSocketAdapter
 
@@ -141,6 +144,7 @@ register_adapter("fyers", FyersWebSocketAdapter)
 register_adapter("definedge", DefinedgeWebSocketAdapter)
 register_adapter("paytm", PaytmWebSocketAdapter)
 register_adapter("indmoney", IndmoneyWebSocketAdapter)
+register_adapter("icici", IciciWebSocketAdapter)
 register_adapter("mstock", MstockWebSocketAdapter)
 register_adapter("motilal", MotilalWebSocketAdapter)
 register_adapter("jainamxts", JainamXTSWebSocketAdapter)
@@ -197,6 +201,7 @@ __all__ = [
     "DefinedgeWebSocketAdapter",
     "PaytmWebSocketAdapter",
     "IndmoneyWebSocketAdapter",
+    "IciciWebSocketAdapter",
     "MstockWebSocketAdapter",
     "MotilalWebSocketAdapter",
     "JainamXTSWebSocketAdapter",
