@@ -57,6 +57,12 @@ interface Props {
   stockSymbol?: { symbol: string; exchange: string }
   /** The spot index, when one is known (price triggers read its LTP). */
   spotSymbol?: { symbol: string; exchange: string } | null
+  /**
+   * What the batch will act on, per Trade toggle — shown on the dialog so
+   * the armed verb's target is never a guess. Both entries may be equal
+   * (a stock workspace trades one book).
+   */
+  actsOn?: { options: string; stock: string }
   onOpenChange(open: boolean): void
   onSubmit(submission: SchedulerSubmit): void
 }
@@ -241,6 +247,16 @@ export function SchedulerDialog(props: Props) {
           </div>
         )}
         {stockNote && <p className="text-[10px] leading-4 text-muted-foreground">{stockNote}</p>}
+
+        {/* What the batch acts on — the symbol the armed verbs will move. */}
+        {props.actsOn && (
+          <p className="text-[10px] leading-4 text-muted-foreground">
+            Acts on{' '}
+            <span className="font-mono font-semibold text-foreground">
+              {target === 'stock' ? props.actsOn.stock : props.actsOn.options}
+            </span>
+          </p>
+        )}
 
         {/* Trigger kind */}
         <div className="flex gap-1">

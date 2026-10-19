@@ -151,6 +151,26 @@ export { dedupeIndicators } from './indicatorTemplates'
 export type { ReplayState }
 
 type ChartInstance = ReturnType<typeof createChart>
+
+/**
+ * A horizontal marker line a host keeps on the price pane — an open
+ * position's entry, its target, its stop. The terminal owns the lifecycle:
+ * `setPriceLines` diffs the list against what is on the chart, adding,
+ * moving and removing in place so a ticking P&L or a level edit repaints
+ * the same line rather than stacking new ones.
+ */
+export interface TerminalPriceLineSpec {
+  /** Stable identity — the same id across calls moves, not re-adds. */
+  id: string
+  price: number
+  color: string
+  /** Price-axis tag (defaults to the formatted price). */
+  label?: string
+  /** Solid badge segment on the pill group, e.g. 'ENT', 'TGT', 'SL'. */
+  badge?: string
+  /** Dotted stroke — the monitoring-level look, vs solid for fills. */
+  dotted?: boolean
+}
 type BuySellButtonsInstance = InstanceType<typeof BuySellButtons>
 type TradeFeedInstance = InstanceType<typeof OpenAlgoTradeFeed>
 type DrawingControllerInstance = InstanceType<typeof DrawingController>
@@ -1081,6 +1101,10 @@ export class TradingTerminal {
 
   private chart: ChartInstance | null = null
   private offBranding: (() => void) | null = null
+  /** Host-managed horizontal marker lines (position entry/target/SL). */
+  private priceLines = new Map<string, PriceLine>()
+  /** The chart the current price lines were added to (a rebuild strands them). */
+  private priceLinesChart: ChartInstance | null = null
   private price: SeriesApi | null = null
   /** The backtest's marker layer, made once and refilled per run. */
   private btMarkers: SeriesMarkers | null = null
@@ -3789,6 +3813,55 @@ export class TradingTerminal {
     this.lsSet('magnet', this.drawMagnet ? '1' : '0')
     this.lsSet('magnet-mode', next)
     this.cb.onDrawChange?.(this.drawStats())
+  }
+
+  /**
+   * Sync the host's horizontal marker lines (an open position's entry, its
+   * target, its stop) onto the primary price pane. Diffs by id: existing ids
+   * move to their new price, absent ids are added, specs missing from the
+   * list are removed — so callers just pass the full desired list each time.
+   * A chart rebuild (symbol reload) clears the stale layer first, since the
+   * primitives died with the old chart.
+   */
+  setPriceLines(specs: TerminalPriceLineSpec[]): void {
+    const chart = this.chart
+    if (!chart) return
+    if (this.priceLinesChart !== chart) {
+      // The chart the old primitives belonged to is gone; start the layer fresh.
+      this.priceLines.clear()
+      this.priceLinesChart = chart
+    }
+    const wanted = new Map(specs.map((spec) => [spec.id, spec]))
+    for (const [id, line] of this.priceLines) {
+      if (wanted.has(id)) continue
+      chart.removePrimitive(line)
+      this.priceLines.delete(id)
+    }
+    for (const [id, spec] of wanted) {
+      if (!Number.isFinite(spec.price)) continue
+      const patch = {
+        price: spec.price,
+        color: spec.color,
+        lineWidth: 1,
+        lineStyle: (spec.dotted ? 'dotted' : 'solid') as 'dotted' | 'solid',
+        ...(spec.badge != null ? { badge: spec.badge } : {}),
+        ...(spec.label != null ? { label: spec.label } : {}),
+      }
+      const existing = this.priceLines.get(id)
+      if (existing) {
+        existing.setOptions(patch)
+        continue
+      }
+      this.priceLines.set(id, chart.addPriceLine({ id, ...patch }))
+    }
+  }
+
+  /** Drop every host marker line (symbol change, position closed). */
+  clearPriceLines(): void {
+    const chart = this.chart
+    if (!chart) return
+    for (const line of this.priceLines.values()) chart.removePrimitive(line)
+    this.priceLines.clear()
   }
 
   /**

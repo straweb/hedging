@@ -30,15 +30,17 @@ afterEach(() => {
 describe('hydrateState', () => {
   it('returns defaults for empty input', () => {
     const state = hydrateState(null)
-    expect(state.mode).toBe('fno')
+    expect(state.version).toBe(4)
     expect(state.tabs).toEqual(DEFAULT_STATE.tabs)
+    expect(state.tabs[0].kind).toBe('fno')
     expect(state.tabs[0].options).toEqual([])
     expect(state.tabs[0].underlying).toBe('NIFTY')
   })
 
   it('merges a partial snapshot over defaults', () => {
     const state = hydrateState({ mode: 'equity', capital: 250000 })
-    expect(state.mode).toBe('equity')
+    // The old global mode folds into the active tab's kind.
+    expect(state.tabs.find((tab) => tab.id === state.activeTabId)?.kind).toBe('stock')
     expect(state.capital).toBe(250000)
   })
 
@@ -55,7 +57,6 @@ describe('hydrateState', () => {
     expect(state.capital).toBe(DEFAULT_STATE.capital)
     expect(state.capitalPercent).toBe(100)
     expect(state.ceShare).toBe(100)
-    expect(state.mode).toBe('fno')
     expect(state.pricetype).toBe('MARKET')
     expect(state.capitalBasis).toBe('initial')
     expect(state.tabs.length).toBeGreaterThan(0)
@@ -65,6 +66,20 @@ describe('hydrateState', () => {
     expect(hydrateState({}).product).toBe('NRML')
     expect(hydrateState({ mode: 'equity' }).product).toBe('NRML') // stored value wins
     expect(hydrateState({ product: 'MIS' }).product).toBe('MIS')
+  })
+
+  it('derives a tab kind from its home exchange, and honors a stored kind', () => {
+    const state = hydrateState({
+      tabs: [
+        { id: 'a', name: 'A', layoutId: 'single', exchange: 'NFO' },
+        { id: 'b', name: 'B', layoutId: 'single', exchange: 'NSE' },
+        { id: 'c', name: 'C', layoutId: 'single', exchange: 'NSE', kind: 'fno' },
+      ],
+    })
+    expect(state.tabs[0].kind).toBe('fno')
+    expect(state.tabs[1].kind).toBe('stock')
+    // A stored kind wins over the exchange's guess.
+    expect(state.tabs[2].kind).toBe('fno')
   })
 
   it('keeps instrument rows inside the tab that carries them', () => {
@@ -156,7 +171,7 @@ describe('hydrateState', () => {
       ],
       activeTabId: 'ws-2',
     })
-    expect(state.version).toBe(3)
+    expect(state.version).toBe(4)
     const active = state.tabs.find((tab) => tab.id === 'ws-2')
     expect(active?.underlying).toBe('BANKNIFTY')
     expect(active?.expiry).toBe('26FEB26')
@@ -213,6 +228,21 @@ describe('hydrateState', () => {
     expect(withPlan.deploy?.strikes).toEqual([24500, 24600])
     expect(withPlan.trigger).toMatchObject({ condition: 'above', price: 24500 })
   })
+
+  it('keeps a canceled row as history and honors the status', () => {
+    const canceled = {
+      id: 'sch-9',
+      action: 'deployA',
+      trigger: { kind: 'time', at: '09:20:00', repeat: 'once' },
+      status: 'canceled',
+      createdAt: 5,
+      modeAtCreation: 'fno',
+      target: 'options',
+    }
+    const state = hydrateState({ scheduled: [canceled] })
+    expect(state.scheduled).toHaveLength(1)
+    expect(state.scheduled[0].status).toBe('canceled')
+  })
 })
 
 describe('round-trip', () => {
@@ -265,7 +295,8 @@ describe('round-trip', () => {
     const storage = new MemoryStorage()
     storage.setItem(HEDGING_STORAGE_KEY, '{not json')
     const state = loadHedgingState(storage)
-    expect(state.mode).toBe(DEFAULT_STATE.mode)
+    expect(state.version).toBe(DEFAULT_STATE.version)
+    expect(state.tabs[0].kind).toBe('fno')
   })
 
   it('survives a refusing storage', () => {

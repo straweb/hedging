@@ -4,7 +4,7 @@ import type { MagnetMode } from 'openalgo-charts/draw'
 import type { WorkspacePane } from 'openalgo-charts/workspace'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
-import { ChartPane, type PaneQuickTrade } from '@/components/trading/ChartPane'
+import { ChartPane, type PanePriceLine, type PaneQuickTrade } from '@/components/trading/ChartPane'
 import { DrawingRail, DrawingRailTab } from '@/components/trading/DrawingRail'
 import { GridDividers } from '@/components/trading/GridDividers'
 import { Button } from '@/components/ui/button'
@@ -112,6 +112,18 @@ interface Props {
    * Called with the pane's `EXCHANGE:SYMBOL` key; null shows nothing.
    */
   quickTradeFor?(symbolKey: string | null): PaneQuickTrade | null
+  /**
+   * The page's marker lines for a charted symbol — an open position's entry
+   * and its monitoring levels. Called with the pane's `EXCHANGE:SYMBOL` key.
+   */
+  priceLinesFor?(paneId: string, symbolKey: string | null): PanePriceLine[]
+  /**
+   * The focused pane and what it charts, so the page can aim the quick
+   * actions, the action-bar's symbol chip and the scheduler's default at
+   * what the trader is actually looking at. Fires on focus changes and on
+   * the focused pane's own symbol changes; null when nothing is focused.
+   */
+  onFocusedPaneChange?(info: { paneId: string; symbolKey: string | null } | null): void
 }
 
 export function HedgingWorkspace(props: Props) {
@@ -321,6 +333,26 @@ export function HedgingWorkspace(props: Props) {
     })
   }, [])
 
+  // The focused pane's identity and symbol, reported up: the page aims the
+  // action bar and the scheduler at what the trader is actually watching.
+  // A tab switch clears the focus first — pane ids belong to their tab, and
+  // the report must never describe a pane the active tab does not own.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: tab?.id is the trigger — the reset runs on every tab change
+  useEffect(() => {
+    setFocusedPaneId(null)
+  }, [tab?.id])
+  const focusedPaneIdRef = focusedPaneId ?? `${tab?.id}:p0`
+  const onFocusedPaneChangeRef = props.onFocusedPaneChange
+  useEffect(() => {
+    // The reset above runs after this effect on the switch render — skip the
+    // beat where the remembered focus still belongs to the previous tab.
+    if (focusedPaneId && !focusedPaneId.startsWith(`${tab?.id}:`)) return
+    onFocusedPaneChangeRef?.({
+      paneId: focusedPaneIdRef,
+      symbolKey: paneSymbols[focusedPaneIdRef] ?? null,
+    })
+  }, [focusedPaneId, focusedPaneIdRef, paneSymbols, onFocusedPaneChangeRef, tab?.id])
+
   const areas = useMemo(() => parseAreas(layout.areas), [layout.areas])
   const showDividers = layout.cells.length > 1
 
@@ -479,6 +511,7 @@ export function HedgingWorkspace(props: Props) {
                   sharedStay={stay}
                   sharedLatch={latched}
                   quickTrade={props.quickTradeFor?.(paneSymbols[paneId] ?? null) ?? undefined}
+                  priceLines={props.priceLinesFor?.(paneId, paneSymbols[paneId] ?? null)}
                   onFocusPane={focusPane}
                   onTerminalChange={noteTerminal}
                   onDrawStats={onPaneDrawStats}

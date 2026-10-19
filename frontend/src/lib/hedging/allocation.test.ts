@@ -6,6 +6,7 @@ import {
   normalizeWeights,
   oneLotPrice,
   rowBudget,
+  seedWeightFor,
   sideCapitals,
   sideDeployedAmount,
   sideOf,
@@ -197,5 +198,50 @@ describe('sideDeployedAmount', () => {
     const rows = withWeights([niftyCE(26000)], [100]).map((row) => ({ ...row, fixedAmount: 5000 }))
     const total = sideDeployedAmount(rows, () => 200, 30000, 'fixed')
     expect(total).toBe(0)
+  })
+})
+
+describe('seedWeightFor', () => {
+  it('seeds a new strike at half the existing strikes mean weight', () => {
+    const rows = withWeights([niftyCE(26000), niftyCE(26100)], [50, 50])
+    expect(seedWeightFor(rows, 'CE')).toBe(25)
+  })
+
+  it('seeds 0 on an empty side — the first strike takes the side', () => {
+    expect(seedWeightFor([], 'CE')).toBe(0)
+    const peOnly = withWeights([niftyPE(26000)], [100])
+    expect(seedWeightFor(peOnly, 'CE')).toBe(0)
+  })
+
+  it('ignores disabled rows and other sides', () => {
+    const rows = withWeights([niftyCE(26000), niftyCE(26100), niftyPE(26000)], [40, 60, 90]).map(
+      (row, index) => (index === 1 ? { ...row, enabled: false } : row)
+    )
+    // Only the enabled CE row counts: mean 40, seed 20.
+    expect(seedWeightFor(rows, 'CE')).toBe(20)
+  })
+
+  it('keeps the merged side summing to 100 with the newcomer at half a peer', () => {
+    // Two strikes at 50 each; a third arrives seeded 25. After normalize,
+    // the newcomer holds roughly half of what each veteran carries.
+    const veterans = withWeights([niftyCE(26000), niftyCE(26100)], [50, 50])
+    const newcomer = niftyCE(26200)
+    newcomer.weight = seedWeightFor(veterans, 'CE')
+    const merged = normalizeWeights([...veterans, newcomer])
+    const byStrike = merged.map((row) => row.weight)
+    expect(byStrike[0]).toBeCloseTo(40, 1)
+    expect(byStrike[1]).toBeCloseTo(40, 1)
+    expect(byStrike[2]).toBeCloseTo(20, 1)
+  })
+
+  it('works for the equity side too', () => {
+    const stocks = withWeights(
+      [
+        makeStockRow({ symbol: 'RELIANCE', exchange: 'NSE' }),
+        makeStockRow({ symbol: 'TCS', exchange: 'NSE' }),
+      ],
+      [70, 30]
+    )
+    expect(seedWeightFor(stocks, 'EQ')).toBe(25)
   })
 })

@@ -21,7 +21,7 @@ import {
   scheduledFromSubmission,
 } from '@/components/hedging/SchedulerDialog'
 import { WatchlistMini } from '@/components/hedging/WatchlistMini'
-import type { PaneQuickTrade } from '@/components/trading/ChartPane'
+import type { PanePriceLine, PaneQuickTrade } from '@/components/trading/ChartPane'
 import type { DockOrder } from '@/components/trading/dock/blotter'
 import { Button } from '@/components/ui/button'
 import { useMarketData } from '@/hooks/useMarketData'
@@ -30,6 +30,7 @@ import {
   slideWeight as applySlide,
   computeRowLots,
   normalizeWeights,
+  seedWeightFor,
   sideCapitals,
   sideOf,
 } from '@/lib/hedging/allocation'
@@ -50,12 +51,11 @@ import {
   newTabId,
   saveHedgingState,
 } from '@/lib/hedging/storage'
-import { planUnderlyingTabs, type UnderlyingSource } from '@/lib/hedging/underlyingTab'
+import { pickKind, planUnderlyingTabs } from '@/lib/hedging/underlyingTab'
 import type {
   HedgingInstrument,
   HedgingState,
   HedgingWorkspaceTab,
-  Mode,
   MultilegLeg,
   MultilegLegResult,
   Order,
@@ -63,9 +63,10 @@ import type {
   Position,
   ScheduledOrder,
   StrikeSide,
+  TabKind,
   Trade,
 } from '@/types/hedging'
-import { emptyTabContext } from '@/types/hedging'
+import { emptyTabContext, FNO_EXCHANGES, fnoExchangeFor } from '@/types/hedging'
 import { showToast } from '@/utils/toast'
 
 /**
@@ -80,10 +81,14 @@ import { showToast } from '@/utils/toast'
  * setup — strike sets, weights, capital, scheduled orders, workspace tabs —
  * persists to localStorage.
  *
- * Every workspace tab owns its market: the underlying it follows, its
- * expiries and its strike/stock rows. Picking an underlying from the top bar
- * opens a fresh tab for it, and switching tabs moves the side panels, the
- * quick actions and the scheduler's batches onto that tab's context, so two
+ * Every workspace tab owns its market AND its species: picking an underlying
+ * from the top bar asks whether the symbol carries F&O derivatives — an F&O
+ * board opens with the spot + legs layout and the CE/PE panels, a plain
+ * stock opens a single chart with the stocks panel. There is no global
+ * switch; the active tab's kind drives the panels, the quick actions and
+ * the scheduler's vocabulary. Picking an underlying from the top bar opens
+ * a fresh tab for it, and switching tabs moves the side panels, the quick
+ * actions and the scheduler's batches onto that tab's context, so two
  * markets can be worked without overwriting each other.
  *
  * Capital follows the house-money ladder: the session trades the allocated
@@ -199,16 +204,16 @@ function HedgingTerminal({ apiKey, wsUrl }: { apiKey: string; wsUrl: string }) {
     setState((previous) => ({ ...previous, ...changes }))
   }, [])
 
-  const fno = state.mode === 'fno'
-
   // ── The active tab IS the instrument context ─────────────────────────────
-  // Each workspace tab carries its own underlying, expiries and strike/stock
-  // rows. Everything below reads this context; the top bar edits it; picking
-  // an underlying from the top bar opens a fresh tab for that market.
+  // Each workspace tab carries its own KIND (F&O market or plain stock),
+  // underlying, expiries and strike/stock rows. Everything below reads this
+  // context; the top bar edits it; picking an underlying from the top bar
+  // opens a fresh tab for that market with the kind the pick resolves to.
   const ctx = useMemo(
     () => state.tabs.find((tab) => tab.id === state.activeTabId) ?? state.tabs[0],
     [state.tabs, state.activeTabId]
   )
+  const fno = ctx.kind === 'fno'
   /** Mutate the active tab's market context (underlying, expiries, rows). */
   const patchCtx = useCallback((changes: Partial<HedgingWorkspaceTab>) => {
     setState((previous) => ({
@@ -218,6 +223,21 @@ function HedgingTerminal({ apiKey, wsUrl }: { apiKey: string; wsUrl: string }) {
       ),
     }))
   }, [])
+
+  // The product follows the active tab's species — NRML carries F&O
+  // positions, cash-equity scalping is intraday (MIS). A tab switch that
+  // lands on the other species re-applies the pairing; a manual product
+  // pick inside a tab survives switches within the same kind.
+  const productKindRef = useRef<TabKind | null>(null)
+  useEffect(() => {
+    if (productKindRef.current === null) {
+      productKindRef.current = ctx.kind
+      return
+    }
+    if (productKindRef.current === ctx.kind) return
+    productKindRef.current = ctx.kind
+    patch({ product: ctx.kind === 'fno' ? 'NRML' : 'MIS' })
+  }, [ctx.kind, patch])
 
   const chainQuery = useQuery({
     queryKey: ['hedging', 'strikes', ctx.underlying, ctx.exchange, ctx.expiry],
@@ -336,7 +356,7 @@ function HedgingTerminal({ apiKey, wsUrl }: { apiKey: string; wsUrl: string }) {
 
   const quoteSymbols = useMemo(() => {
     const list: Array<{ symbol: string; exchange: string }> = []
-    if (fno) {
+    if (ctx.kind === 'fno') {
       if (chartFuture) list.push({ symbol: chartFuture.symbol, exchange: ctx.exchange })
       if (stockInstrument) list.push(stockInstrument)
       // The spot index feeds the Index tab and price triggers armed on it.
@@ -355,7 +375,7 @@ function HedgingTerminal({ apiKey, wsUrl }: { apiKey: string; wsUrl: string }) {
     for (const item of list) unique.set(`${item.exchange}:${item.symbol}`, item)
     return [...unique.values()]
   }, [
-    fno,
+    ctx.kind,
     chartFuture,
     stockInstrument,
     chain,
@@ -366,7 +386,14 @@ function HedgingTerminal({ apiKey, wsUrl }: { apiKey: string; wsUrl: string }) {
     watchlistSymbols,
   ])
 
-  const { data: marketData } = useMarketData({ symbols: quoteSymbols, mode: 'LTP' })
+  // Quote mode, not bare LTP: the rows' session low/high (the range rail on
+  // every strike and stock) rides the same feed, and the OHLC fields come
+  // with the tick — one subscription per symbol either way.
+  const { data: marketData } = useMarketData({ symbols: quoteSymbols, mode: 'Quote' })
+  // Live quotes read through this ref by the 1s cadences (the scheduler tick
+  // and the LTP tape) — stable regardless of how fast the feed re-renders.
+  const marketDataRef = useRef(marketData)
+  marketDataRef.current = marketData
   const getLtp = useCallback(
     (symbol: string, exchange: string) => marketData.get(`${exchange}:${symbol}`)?.data.ltp,
     [marketData]
@@ -375,6 +402,43 @@ function HedgingTerminal({ apiKey, wsUrl }: { apiKey: string; wsUrl: string }) {
     (row: HedgingInstrument) => getLtp(row.symbol, row.exchange),
     [getLtp]
   )
+  /** The session's low/high marks for a row's quote (the range rail). */
+  const getSessionRange = useCallback(
+    (row: HedgingInstrument) => {
+      const data = marketData.get(`${row.exchange}:${row.symbol}`)?.data
+      return { low: data?.low, high: data?.high }
+    },
+    [marketData]
+  )
+
+  // ── LTP tape: one second, one point per subscribed symbol ──────────────
+  // Open-position rows draw their live tape against the fill's entry and
+  // the row's monitoring levels; the buffer is a ref the interval mutates,
+  // so the 1s cadence never re-renders anything by itself (rows re-render
+  // on the quote ticks that matter anyway). ~3 minutes of tape at 1s.
+  const ltpHistory = useRef(new Map<string, number[]>())
+  const quoteSymbolsRef = useRef(quoteSymbols)
+  quoteSymbolsRef.current = quoteSymbols
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      for (const item of quoteSymbolsRef.current) {
+        const key = `${item.exchange}:${item.symbol}`
+        const ltp = marketDataRef.current.get(key)?.data.ltp
+        if (ltp == null || !Number.isFinite(ltp)) continue
+        const tape = ltpHistory.current.get(key)
+        if (tape) {
+          tape.push(ltp)
+          if (tape.length > 180) tape.shift()
+        } else {
+          ltpHistory.current.set(key, [ltp])
+        }
+      }
+    }, 1000)
+    return () => window.clearInterval(timer)
+  }, [])
+  const getLtpHistory = useCallback((row: HedgingInstrument) => {
+    return ltpHistory.current.get(`${row.exchange}:${row.symbol}`) ?? []
+  }, [])
 
   // ── Derived capital + summaries ─────────────────────────────────────────
   // The allocation: a fixed amount (clamped to cash — an allocation larger
@@ -497,6 +561,10 @@ function HedgingTerminal({ apiKey, wsUrl }: { apiKey: string; wsUrl: string }) {
           strike,
           optionType: side,
           lotSize: leg.lotsize ?? 1,
+          // A new strike starts at half the existing strikes' weight — the
+          // merge's normalize then lands it at roughly half an existing
+          // strike's share instead of halving everyone else.
+          weight: seedWeightFor(ctx.options, side),
         })
       }
 
@@ -529,6 +597,7 @@ function HedgingTerminal({ apiKey, wsUrl }: { apiKey: string; wsUrl: string }) {
         symbol: pick.symbol,
         exchange: pick.exchange,
         lotSize: pick.lotsize || 1,
+        weight: seedWeightFor(ctx.stocks, 'EQ'),
       })
       if (ctx.stocks.some((existing) => existing.id === row.id)) {
         showToast.info(`${pick.symbol} is already in the active list.`)
@@ -924,10 +993,9 @@ function HedgingTerminal({ apiKey, wsUrl }: { apiKey: string; wsUrl: string }) {
     }))
   }, [])
 
-  // The engine tick. Quotes and batch actions are read through refs so the
-  // one-second cadence is stable regardless of how fast the feed re-renders.
-  const marketDataRef = useRef(marketData)
-  marketDataRef.current = marketData
+  // The engine tick: quotes and batch actions read through the refs above
+  // (marketDataRef / quoteSymbolsRef), so the one-second cadence is stable
+  // regardless of how fast the feed re-renders.
   useEffect(() => {
     const timer = window.setInterval(() => {
       const now = new Date()
@@ -958,7 +1026,9 @@ function HedgingTerminal({ apiKey, wsUrl }: { apiKey: string; wsUrl: string }) {
   /** Add (or replace) a scheduled row from the dialog, arming it safely. */
   const submitScheduled = useCallback(
     (submission: SchedulerSubmit) => {
-      const row = scheduledFromSubmission(submission, state.mode)
+      // Vocabulary at creation: an F&O board reads CE/PE, a stock board
+      // Buy/Sell (the persisted rows keep that label through tab switches).
+      const row = scheduledFromSubmission(submission, fno ? 'fno' : 'equity')
       // A time already passed must not fire the moment it is armed: a once
       // entry retires as missed, a daily entry waits for tomorrow's pass.
       if (row.trigger.kind === 'time') {
@@ -983,13 +1053,20 @@ function HedgingTerminal({ apiKey, wsUrl }: { apiKey: string; wsUrl: string }) {
         `${scheduleActionLabel(row.action, row.modeAtCreation, row.target)} scheduled — ${row.trigger.kind === 'time' ? `${row.trigger.at} IST` : 'on the price trigger'}.`
       )
     },
-    [state.mode]
+    [fno]
   )
 
+  /** Cancel = history, not deletion: the row survives with its trigger and
+   * batch, badge flips to canceled, and Repeat/Edit stay — the trader can
+   * see what was disarmed and re-arm it without reconstructing it. */
   const cancelScheduled = useCallback((id: string) => {
     setState((previous) => ({
       ...previous,
-      scheduled: previous.scheduled.filter((entry) => entry.id !== id),
+      scheduled: previous.scheduled.map((entry) =>
+        entry.id === id && entry.status === 'pending'
+          ? { ...entry, status: 'canceled' as const }
+          : entry
+      ),
     }))
   }, [])
 
@@ -1183,24 +1260,37 @@ function HedgingTerminal({ apiKey, wsUrl }: { apiKey: string; wsUrl: string }) {
     const id = newTabId()
     const index = state.tabs.length + 1
     patch({
-      tabs: [...state.tabs, emptyTabContext(id, `W${index}`, 'single', ctx.exchange)],
+      tabs: [...state.tabs, emptyTabContext(id, `W${index}`, 'single', ctx.kind, ctx.exchange)],
       activeTabId: id,
     })
   }
 
+  /** Ask the symbol's home derivative exchange whether it lists option
+   * expiries — the one honest answer to "does this have F&O". A failed ask
+   * degrades to a plain stock chart, which every symbol has. */
+  const askOptionExpiries = async (pick: UnderlyingPick): Promise<string[] | null> => {
+    try {
+      const res = await scalpingApi.getExpiry(pick.symbol, fnoExchangeFor(pick.exchange), 'options')
+      return res.data ?? []
+    } catch {
+      return null
+    }
+  }
+
   /** A top-bar pick opens that market in a brand-new workspace tab — every
-   * selection gets its own board with the spot + legs layout, never a
-   * re-dress of an older tab (whose layout the trader may have rebuilt).
-   * The F&O tab is born with the spot + legs layout, and its chain snapshot
-   * auto-seeds the spot / ATM CE / ATM PE charts. The one exception is the
-   * auto-pick that lands an exchange or mode switch: it adopts the pristine
-   * tab that switch just cleared instead of littering the strip. The strip
-   * arithmetic itself lives in lib/hedging/underlyingTab, under test. */
-  const openUnderlyingWorkspace = (pick: UnderlyingPick, source?: UnderlyingSource) => {
+   * selection gets its own board, never a re-dress of an older tab (whose
+   * layout the trader may have rebuilt). The KIND the pick resolves to
+   * decides the board: a symbol with F&O derivatives (or picked straight off
+   * a derivative exchange) opens the spot + legs layout and auto-seeds the
+   * spot / ATM CE / ATM PE charts when its chain lands; a plain stock opens
+   * single-pane and charts itself. The strip arithmetic lives in
+   * lib/hedging/underlyingTab, under test. */
+  const openUnderlyingWorkspace = async (pick: UnderlyingPick) => {
     setAutoSeed(null)
+    const expiries = FNO_EXCHANGES.has(pick.exchange) ? [] : await askOptionExpiries(pick)
+    const kind = pickKind(pick, expiries)
     setState((previous) => {
-      const fnoMode = previous.mode === 'fno'
-      const plan = planUnderlyingTabs(previous, pick, fnoMode, source ?? 'user')
+      const plan = planUnderlyingTabs(previous, pick, kind)
       pendingAutoSeed.current = plan.autoSeedTabId
         ? { tabId: plan.autoSeedTabId, underlying: pick.symbol }
         : null
@@ -1348,6 +1438,118 @@ function HedgingTerminal({ apiKey, wsUrl }: { apiKey: string; wsUrl: string }) {
     [fno, indexSymbols, deploy]
   )
 
+  // ── Focused pane: what the trader is looking at right now ──────────────
+  // Selecting a pane re-aims the action bar's symbol chip and the
+  // scheduler's default at that pane's chart — an F&O chart reads CE/PE and
+  // the spot index; a simple stock reads Buy/Sell and the stock itself. The
+  // user can change the scheduler's pick afterwards; this only sets defaults.
+  const [focusedPane, setFocusedPane] = useState<{
+    tabId: string
+    paneId: string
+    symbolKey: string | null
+  } | null>(null)
+  const onFocusedPaneChange = useCallback(
+    (info: { paneId: string; symbolKey: string | null } | null) => {
+      if (!info) {
+        setFocusedPane(null)
+        return
+      }
+      setFocusedPane({ tabId: ctx.id, paneId: info.paneId, symbolKey: info.symbolKey })
+    },
+    [ctx.id]
+  )
+  const focusedInstrument = useMemo(() => {
+    if (!focusedPane || focusedPane.tabId !== ctx.id || !focusedPane.symbolKey) return null
+    const [exchange, symbol] = focusedPane.symbolKey.split(':')
+    if (!symbol) return null
+    return { symbol, exchange }
+  }, [focusedPane, ctx.id])
+
+  // The action bar's chip: for the CE/PE batch the spot index (the panels
+  // hold that index's options), for a Buy/Sell batch the stock the panel
+  // trades. A focused pane only refines the stock case when it charts a
+  // different symbol than the tab's underlying — the batches still act on
+  // the active tab's panels, so the tab's own market stays the answer.
+  const actionSymbol = useMemo(() => {
+    if (fno) return chain?.underlying_symbol ?? (ctx.underlying || null)
+    return focusedInstrument?.symbol ?? ctx.underlying ?? null
+  }, [fno, chain, ctx.underlying, focusedInstrument])
+
+  // The scheduler's default trigger symbol: the focused pane's chart, then
+  // the tab's own market (futures contract for stock-target, spot index,
+  // cash symbol). Displayed on the dialog; changeable there.
+  const schedulerDefaultSymbol = useMemo(() => {
+    if (focusedInstrument) return focusedInstrument
+    if (fno) {
+      if (stockInstrument)
+        return { symbol: stockInstrument.symbol, exchange: stockInstrument.exchange }
+      return indexSpot ?? undefined
+    }
+    return ctx.underlying ? { symbol: ctx.underlying, exchange: ctx.exchange } : undefined
+  }, [focusedInstrument, fno, stockInstrument, indexSpot, ctx.underlying, ctx.exchange])
+
+  // The dialog's "Acts on" line, per Trade toggle.
+  const schedulerActsOn = useMemo(() => {
+    if (fno) {
+      return {
+        options: indexSpot
+          ? `${indexSpot.symbol} option panels (CE/PE)`
+          : `${ctx.underlying || 'the workspace'}'s option panels (CE/PE)`,
+        stock: stockInstrument
+          ? `${stockInstrument.symbol} (${stockInstrument.exchange}) — Buy/Sell`
+          : 'the underlying once a symbol is picked',
+      }
+    }
+    const name = focusedInstrument?.symbol ?? ctx.underlying ?? 'the workspace'
+    return { options: `${name} stocks panel (Buy/Sell)`, stock: `${name} (Buy/Sell)` }
+  }, [fno, indexSpot, ctx.underlying, stockInstrument, focusedInstrument])
+
+  // ── Chart marker lines: the open position's entry and its levels ────────
+  // A pane charting a symbol with an open position draws the fill's average
+  // price (solid, direction-coloured) and the row's target/SL (dotted) —
+  // the same numbers the row's sparkline carries, on the price chart itself.
+  const priceLinesFor = useCallback(
+    (_paneId: string, symbolKey: string | null): PanePriceLine[] => {
+      if (!symbolKey) return []
+      const [exchange, symbol] = symbolKey.split(':')
+      if (!symbol) return []
+      const position = positionsBySymbol.get(symbol)
+      const row = [...ctx.options, ...ctx.stocks].find(
+        (item) => item.symbol === symbol && item.exchange === exchange
+      )
+      const lines: PanePriceLine[] = []
+      if (position) {
+        lines.push({
+          id: 'pos-entry',
+          price: position.average_price,
+          color: position.quantity > 0 ? '#10b981' : '#ef4444',
+          badge: position.quantity > 0 ? 'LONG' : 'SHORT',
+          label: `Entry ${position.average_price.toFixed(2)}`,
+        })
+      }
+      if (row?.target != null) {
+        lines.push({
+          id: 'pos-target',
+          price: row.target,
+          color: '#10b981',
+          badge: 'TGT',
+          dotted: true,
+        })
+      }
+      if (row?.stoploss != null) {
+        lines.push({
+          id: 'pos-sl',
+          price: row.stoploss,
+          color: '#ef4444',
+          badge: 'SL',
+          dotted: true,
+        })
+      }
+      return lines
+    },
+    [positionsBySymbol, ctx.options, ctx.stocks]
+  )
+
   const sidePanel = (side: StrikeSide | 'EQ', title: string) => (
     <InstrumentPanel
       kind={side === 'EQ' ? 'stock' : 'option'}
@@ -1358,6 +1560,8 @@ function HedgingTerminal({ apiKey, wsUrl }: { apiKey: string; wsUrl: string }) {
       sideCapital={capitals[side]}
       sideMode={state.sideMode}
       getLtp={getRowLtp}
+      getSessionRange={getSessionRange}
+      getLtpHistory={getLtpHistory}
       positionsBySymbol={positionsBySymbol}
       pendingBySymbol={pendingBySymbol}
       busyIds={rowBusy}
@@ -1381,7 +1585,7 @@ function HedgingTerminal({ apiKey, wsUrl }: { apiKey: string; wsUrl: string }) {
   return (
     <div className="flex h-screen flex-col overflow-hidden text-xs">
       <HedgingTopBar
-        mode={state.mode}
+        fno={fno}
         exchange={ctx.exchange}
         underlying={ctx.underlying}
         expiry={ctx.expiry}
@@ -1395,38 +1599,7 @@ function HedgingTerminal({ apiKey, wsUrl }: { apiKey: string; wsUrl: string }) {
         product={state.product}
         pnl={dayPnl}
         funds={funds}
-        onModeChange={(mode: Mode) => {
-          // The mode sets its product default: NRML carries F&O positions,
-          // cash equity scalping is intraday (MIS). The active tab's market
-          // resets — the other tabs keep whatever they were following.
-          patch({ mode, product: mode === 'fno' ? 'NRML' : 'MIS' })
-          // The exchange vocabularies do not overlap: F&O trades NFO/BFO/
-          // MCX/CDS, equity NSE/BSE. A tab left from the other mode resets
-          // to its home exchange (search and expiries answer there); its
-          // rows stay, so switching back restores the book untouched.
-          setState((previous) => {
-            const active = previous.tabs.find((tab) => tab.id === previous.activeTabId)
-            if (!active) return previous
-            const valid =
-              mode === 'fno'
-                ? ['NFO', 'BFO', 'MCX', 'CDS'].includes(active.exchange)
-                : ['NSE', 'BSE'].includes(active.exchange)
-            if (valid) return previous
-            const exchange = mode === 'fno' ? 'NFO' : 'NSE'
-            return {
-              ...previous,
-              tabs: previous.tabs.map((tab) =>
-                tab.id === active.id
-                  ? { ...tab, exchange, underlying: '', expiry: '', futuresExpiry: '' }
-                  : tab
-              ),
-            }
-          })
-        }}
-        onExchangeChange={(exchange) =>
-          patchCtx({ exchange, underlying: '', expiry: '', futuresExpiry: '' })
-        }
-        onUnderlyingChange={openUnderlyingWorkspace}
+        onUnderlyingChange={(pick) => void openUnderlyingWorkspace(pick)}
         onExpiryChange={(expiry) => patchCtx({ expiry })}
         onFuturesExpiryChange={(expiry) => patchCtx({ futuresExpiry: expiry })}
         onCapitalChange={(value) => patch({ capital: value })}
@@ -1491,6 +1664,8 @@ function HedgingTerminal({ apiKey, wsUrl }: { apiKey: string; wsUrl: string }) {
             })
           }
           quickTradeFor={quickTradeFor}
+          priceLinesFor={priceLinesFor}
+          onFocusedPaneChange={onFocusedPaneChange}
         />
 
         {/* Right column */}
@@ -1514,7 +1689,7 @@ function HedgingTerminal({ apiKey, wsUrl }: { apiKey: string; wsUrl: string }) {
       </div>
 
       <HedgingDock
-        mode={state.mode}
+        mode={fno ? 'fno' : 'equity'}
         collapsed={dockCollapsed}
         quickBusy={quickBusy}
         rowBusy={rowBusy}
@@ -1536,6 +1711,7 @@ function HedgingTerminal({ apiKey, wsUrl }: { apiKey: string; wsUrl: string }) {
         onRepeatScheduled={(entry) => repeatScheduled(entry)}
         scheduledBusy={scheduledBusy}
         underlying={ctx.underlying}
+        actionSymbol={actionSymbol}
         indexSpot={indexSpot}
         onLoadChart={loadIntoChart}
         pnl={realizedPnl}
@@ -1573,20 +1749,13 @@ function HedgingTerminal({ apiKey, wsUrl }: { apiKey: string; wsUrl: string }) {
 
       <SchedulerDialog
         open={schedulerOpen}
-        mode={state.mode}
+        mode={fno ? 'fno' : 'equity'}
         initial={editingScheduled}
         triggerSymbols={quoteSymbols}
-        defaultSymbol={
-          fno
-            ? stockInstrument
-              ? { symbol: stockInstrument.symbol, exchange: stockInstrument.exchange }
-              : (indexSpot ?? undefined)
-            : ctx.underlying
-              ? { symbol: ctx.underlying, exchange: ctx.exchange }
-              : undefined
-        }
+        defaultSymbol={schedulerDefaultSymbol}
         stockSymbol={stockInstrument ?? undefined}
         spotSymbol={indexSpot ?? undefined}
+        actsOn={schedulerActsOn}
         onOpenChange={(open) => {
           if (!open) {
             setSchedulerOpen(false)

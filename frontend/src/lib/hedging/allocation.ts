@@ -24,6 +24,21 @@ export function isSameSide(a: StrikeSide | 'EQ', b: StrikeSide | 'EQ'): boolean 
 }
 
 /**
+ * The seed weight a NEWLY ADDED row starts at: half of what the side's
+ * enabled rows already carry (the mean of their weights). The first row on
+ * an empty side seeds 0 — normalization then hands it the full side. After
+ * the merge normalizes the side back to 100, the newcomer lands at roughly
+ * half an existing strike's share, so adding a strike never halves everyone
+ * else's allocation the way an even split would.
+ */
+export function seedWeightFor(rows: HedgingInstrument[], side: StrikeSide | 'EQ'): number {
+  const siblings = rows.filter((row) => row.enabled && isSameSide(sideOf(row), side))
+  if (siblings.length === 0) return 0
+  const mean = siblings.reduce((sum, row) => sum + Math.max(0, row.weight), 0) / siblings.length
+  return Math.round(((mean * 50) / 100) * 10) / 10
+}
+
+/**
  * Scale a side's enabled weights so they sum to exactly 100 (rounded to one
  * decimal). Called after adds/removes/toggles so the side never drifts.
  */

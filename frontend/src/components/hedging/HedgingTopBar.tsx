@@ -1,6 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
 import { ChevronDown, LogOut, Menu as MenuIcon, Pin, RefreshCw, Search } from 'lucide-react'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate } from 'react-router'
 import { authClient } from '@/api/client'
 import { scalpingApi } from '@/api/scalping'
@@ -25,18 +25,21 @@ import {
 import { useProfileMenuItems } from '@/hooks/useProfileMenuItems'
 import { cn } from '@/lib/utils'
 import { useAuthStore } from '@/stores/authStore'
-import type { CapitalBasis, CapitalSource, HedgingProduct, Mode, SideMode } from '@/types/hedging'
+import type { CapitalBasis, CapitalSource, HedgingProduct, SideMode } from '@/types/hedging'
+import type { SearchInstrument } from '@/types/scalping'
 
 /**
- * The hedging terminal's compact top bar: instrument selection (exchange,
- * underlying, expiries), the equity/FNO switch, funds + the session's capital
- * basis, day P&L and one compact menu standing in for the full navbar.
+ * The hedging terminal's compact top bar: one underlying picker that finds
+ * every exchange's symbols, the expiries the active workspace's market
+ * carries, funds + the session's capital basis, day P&L and one compact menu
+ * standing in for the full navbar.
  *
- * F&O underlyings start from a pinned list of the market's standard indices
- * and commodities — NIFTY, SENSEX, BANKNIFTY, CRUDEOIL, NATURALGAS, GOLD,
- * SILVER — so the terminal is usable the moment it opens, before (or without)
- * the exchange's full master contract listing. The full list for the chosen
- * exchange loads under the pinned names.
+ * There is no F&O/Equity switch and no exchange dropdown here — what a
+ * workspace trades is the workspace's own kind, decided by the pick (a
+ * symbol with derivatives opens an F&O board, a plain stock a single chart).
+ * The picker answers for every exchange at once: the market's standard
+ * indexes pinned at the top, and a live search beneath them that fans out
+ * across NSE/BSE/NFO/BFO/MCX/CDS in one go.
  *
  * Everything is sized for density — this bar is 40px tall and every pixel of
  * vertical space it saves goes to the charts.
@@ -48,13 +51,10 @@ export interface TopBarFunds {
   m2munrealized: number
 }
 
-const FNO_EXCHANGES = ['NFO', 'BFO', 'MCX', 'CDS']
-const EQUITY_EXCHANGES = ['NSE', 'BSE']
-
 /**
- * The market's standard F&O names, each with its home exchange. Picking one
- * moves the terminal to that exchange. They are always offered — the fetched
- * listing supplements them, never replaces them.
+ * The market's standard F&O names, each with its home exchange. They are
+ * always offered — the "Indexes" section of the picker — while the search
+ * beneath finds everything else on every exchange.
  */
 export const DEFAULT_FNO_UNDERLYINGS: UnderlyingPick[] = [
   { symbol: 'NIFTY', exchange: 'NFO' },
@@ -66,6 +66,9 @@ export const DEFAULT_FNO_UNDERLYINGS: UnderlyingPick[] = [
   { symbol: 'SILVER', exchange: 'MCX' },
 ]
 
+/** Every exchange the unified search asks — legs and cash, one fan-out. */
+const SEARCH_EXCHANGES = ['NSE', 'BSE', 'NFO', 'BFO', 'MCX', 'CDS']
+
 const fmtMoney = (value: number) => value.toLocaleString('en-IN', { maximumFractionDigits: 0 })
 
 const fmtMoney2 = (value: number) =>
@@ -76,10 +79,6 @@ export interface UnderlyingPick {
   exchange: string
 }
 
-/** The pinned names that belong to one exchange. */
-const defaultsFor = (exchange: string) =>
-  DEFAULT_FNO_UNDERLYINGS.filter((pick) => pick.exchange === exchange)
-
 const BASIS_LABEL: Record<CapitalBasis, string> = {
   initial: 'Initial',
   withPnl: '+ P&L',
@@ -87,9 +86,9 @@ const BASIS_LABEL: Record<CapitalBasis, string> = {
 }
 
 /**
- * The products a mode may carry, in click-cycle order. F&O positions default
- * to NRML (carry them if the session runs long); cash equity scalping is
- * intraday, so MIS, with CNC for delivery swings.
+ * The products a market may carry, in click-cycle order. F&O positions
+ * default to NRML (carry them if the session runs long); cash equity
+ * scalping is intraday, so MIS, with CNC for delivery swings.
  */
 const PRODUCTS_FOR = (fno: boolean): HedgingProduct[] => (fno ? ['NRML', 'MIS'] : ['MIS', 'CNC'])
 
@@ -107,7 +106,9 @@ const BASIS_HINT: Record<CapitalBasis, string> = {
 }
 
 interface Props {
-  mode: Mode
+  /** The active workspace's kind — F&O shows the expiry pair, both show product. */
+  fno: boolean
+  /** The active workspace's home exchange (the expiry APIs answer per exchange). */
   exchange: string
   underlying: string
   expiry: string
@@ -122,14 +123,11 @@ interface Props {
   product: string
   pnl: number
   funds: TopBarFunds | null
-  onModeChange(mode: Mode): void
-  onExchangeChange(exchange: string): void
   /**
-   * A pick from the picker rows ('user') always opens a fresh workspace;
-   * the auto-pick that lands an exchange/mode switch on a valid underlying
-   * ('autopick') adopts the pristine tab that switch just cleared.
+   * A pick from the picker rows — pinned index or a search hit from any
+   * exchange — always opens a fresh workspace for that market.
    */
-  onUnderlyingChange(pick: UnderlyingPick, source?: 'user' | 'autopick'): void
+  onUnderlyingChange(pick: UnderlyingPick): void
   onExpiryChange(expiry: string): void
   onFuturesExpiryChange(expiry: string): void
   onCapitalChange(capital: number): void
@@ -147,75 +145,52 @@ export function HedgingTopBar(props: Props) {
   const profileItems = useProfileMenuItems()
   const [underlyingOpen, setUnderlyingOpen] = useState(false)
   const [query, setQuery] = useState('')
-  const searchRef = useRef<HTMLDivElement | null>(null)
 
-  const fno = props.mode === 'fno'
-  const exchanges = fno ? FNO_EXCHANGES : EQUITY_EXCHANGES
-
-  // ── Underlying candidates ────────────────────────────────────────────────
-  // FNO: the pinned market defaults, always, plus every option underlying the
-  // exchange lists (indices first) via the scalping blueprint. Equity: a live
-  // search over the exchange's symbols.
-  const underlyingsQuery = useQuery({
-    queryKey: ['hedging', 'underlyings', props.exchange],
-    queryFn: () => scalpingApi.getAllUnderlyings(props.exchange, 'options'),
-    enabled: fno,
-    staleTime: 60 * 60 * 1000,
-    retry: 1,
-  })
+  // ── Unified symbol search: one needle, every exchange ────────────────────
+  // The fan-out fires all six exchanges in parallel and merges the answers,
+  // de-duplicated by EXCHANGE:SYMBOL (the same name listing on two boards is
+  // two rows — RELIANCE on NSE and its derivatives on NFO trade differently).
   const searchQuery = useQuery({
-    queryKey: ['hedging', 'symbol-search', props.exchange, query],
-    queryFn: () => scalpingApi.search(props.exchange, query),
-    enabled: !fno && query.trim().length >= 2,
+    queryKey: ['hedging', 'symbol-search', query],
+    queryFn: async (): Promise<SearchInstrument[]> => {
+      const answers = await Promise.all(
+        SEARCH_EXCHANGES.map((exchange) =>
+          scalpingApi
+            .search(exchange, query)
+            .then((res) => res.data ?? [])
+            .catch(() => [] as SearchInstrument[])
+        )
+      )
+      const seen = new Set<string>()
+      const merged: SearchInstrument[] = []
+      for (const rows of answers) {
+        for (const row of rows) {
+          const key = `${row.exchange}:${row.symbol}`
+          if (seen.has(key)) continue
+          seen.add(key)
+          merged.push(row)
+        }
+      }
+      merged.sort(
+        (a, b) => a.symbol.localeCompare(b.symbol) || a.exchange.localeCompare(b.exchange)
+      )
+      return merged.slice(0, 40)
+    },
+    enabled: query.trim().length >= 2,
     staleTime: 60 * 1000,
   })
-
-  const fetchedPicks: UnderlyingPick[] = useMemo(() => {
-    const list = underlyingsQuery.data?.data ?? []
-    return list.map((symbol) => ({ symbol, exchange: props.exchange }))
-  }, [underlyingsQuery.data, props.exchange])
-
-  const equityOptions: UnderlyingPick[] = useMemo(() => {
-    const rows = searchQuery.data?.data ?? []
-    return rows.slice(0, 30).map((row) => ({ symbol: row.symbol, exchange: row.exchange }))
-  }, [searchQuery.data])
-
-  // Auto-pick: an exchange (or mode) change lands on a valid underlying — the
-  // current one if the listing knows it or a pinned default covers it, else
-  // the exchange's first pinned default, else the listing's first.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: auto-pick runs only when the underlying list arrives
-  useEffect(() => {
-    if (!fno) return
-    if (underlyingsQuery.isLoading) return
-    if (props.underlying) {
-      const pinned = defaultsFor(props.exchange).some((pick) => pick.symbol === props.underlying)
-      const listed = (underlyingsQuery.data?.data ?? []).includes(props.underlying)
-      if (pinned || listed) return
-    }
-    const fallback =
-      defaultsFor(props.exchange)[0] ?? (underlyingsQuery.data?.data ?? [])[0] ?? null
-    if (fallback) props.onUnderlyingChange(fallback, 'autopick')
-  }, [underlyingsQuery.data, underlyingsQuery.isLoading, props.exchange])
 
   useEffect(() => {
     if (underlyingOpen) setQuery('')
   }, [underlyingOpen])
 
   const needle = query.trim().toUpperCase()
-  const pinnedDefaults = fno ? DEFAULT_FNO_UNDERLYINGS : []
   const shownDefaults = useMemo(
-    () => pinnedDefaults.filter((pick) => (needle ? pick.symbol.includes(needle) : true)),
-    [pinnedDefaults, needle]
+    () => DEFAULT_FNO_UNDERLYINGS.filter((pick) => (needle ? pick.symbol.includes(needle) : true)),
+    [needle]
   )
-  const shownFetched = useMemo(() => {
-    const base = fetchedPicks.filter(
-      (pick) => !shownDefaults.some((pinned) => pinned.symbol === pick.symbol)
-    )
-    return (needle ? base.filter((pick) => pick.symbol.includes(needle)) : base).slice(0, 60)
-  }, [fetchedPicks, shownDefaults, needle])
-
-  const shownPicks = fno ? shownFetched : equityOptions
-  const listingEmpty = fno && !underlyingsQuery.isLoading && fetchedPicks.length === 0
+  const searching = query.trim().length >= 2
+  const hits = searchQuery.data ?? []
 
   const doLogout = async () => {
     try {
@@ -232,52 +207,9 @@ export function HedgingTopBar(props: Props) {
 
   return (
     <div className="flex h-10 shrink-0 items-center gap-1.5 border-b bg-background px-2 text-xs">
-      {/* Mode switch */}
-      <div className="flex overflow-hidden rounded-md border">
-        <button
-          type="button"
-          onClick={() => props.onModeChange('fno')}
-          className={cn(
-            'px-2 py-1 font-medium',
-            fno ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:bg-muted'
-          )}
-        >
-          F&O
-        </button>
-        <button
-          type="button"
-          onClick={() => props.onModeChange('equity')}
-          className={cn(
-            'px-2 py-1 font-medium',
-            !fno ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:bg-muted'
-          )}
-        >
-          Equity
-        </button>
-      </div>
-
-      {/* Exchange */}
-      <Select
-        value={props.exchange}
-        onValueChange={(value) => {
-          props.onExchangeChange(value)
-          setUnderlyingOpen(true)
-        }}
-      >
-        <SelectTrigger className="h-7 w-[74px] px-2 text-xs" aria-label="Exchange">
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent>
-          {exchanges.map((exchange) => (
-            <SelectItem key={exchange} value={exchange} className="text-xs">
-              {exchange}
-            </SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
-
-      {/* Underlying / symbol — a searchable picker, primed with the market's
-          standard names so it answers before (or without) the full listing */}
+      {/* Underlying / symbol — a searchable picker across every exchange,
+          primed with the market's standard indexes so it answers before (or
+          without) the search */}
       <Popover open={underlyingOpen} onOpenChange={setUnderlyingOpen}>
         <PopoverTrigger asChild>
           <Button
@@ -294,22 +226,22 @@ export function HedgingTopBar(props: Props) {
           align="start"
           onOpenAutoFocus={(e) => e.preventDefault()}
         >
-          <div ref={searchRef}>
+          <div>
             <div className="relative">
               <Search className="absolute top-1/2 left-2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
               <Input
                 autoFocus
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                placeholder={fno ? 'Filter underlyings…' : 'Search symbol (min 2 chars)…'}
+                placeholder="Search any exchange (min 2 chars)…"
                 className="h-7 pl-7 text-xs"
               />
             </div>
             <div className="mt-1 max-h-64 overflow-y-auto">
-              {fno && shownDefaults.length > 0 && (
+              {shownDefaults.length > 0 && (
                 <>
                   <p className="px-2 pt-1 pb-0.5 text-[9px] font-semibold tracking-wide text-muted-foreground uppercase">
-                    Market defaults
+                    Indexes
                   </p>
                   {shownDefaults.map((pick) => (
                     <UnderlyingRow
@@ -323,42 +255,17 @@ export function HedgingTopBar(props: Props) {
                       }}
                     />
                   ))}
-                  <p className="mt-1 px-2 pt-1 pb-0.5 text-[9px] font-semibold tracking-wide text-muted-foreground uppercase">
-                    {props.exchange} listing
-                  </p>
                 </>
               )}
-              {underlyingsQuery.isLoading && (
-                <p className="p-2 text-[11px] text-muted-foreground">Loading listing…</p>
-              )}
-              {underlyingsQuery.isError && fno && (
-                <button
-                  type="button"
-                  onClick={() => void underlyingsQuery.refetch()}
-                  className="flex w-full items-center gap-1 rounded px-2 py-1 text-left text-[11px] text-amber-600 hover:bg-muted"
-                >
-                  <RefreshCw className="h-3 w-3" /> Listing failed — retry
-                </button>
-              )}
-              {listingEmpty && (
-                <p className="p-2 text-[10px] leading-4 text-muted-foreground">
-                  The exchange listing is empty — the master contract may still be downloading. The
-                  market defaults above stay available.
+              {searching && (
+                <p className="mt-1 px-2 pt-1 pb-0.5 text-[9px] font-semibold tracking-wide text-muted-foreground uppercase">
+                  Symbols
                 </p>
               )}
-              {!underlyingsQuery.isError &&
-                shownPicks.map((pick) => (
-                  <UnderlyingRow
-                    key={`${pick.exchange}:${pick.symbol}`}
-                    pick={pick}
-                    active={pick.symbol === props.underlying}
-                    onPick={(chosen) => {
-                      props.onUnderlyingChange(chosen)
-                      setUnderlyingOpen(false)
-                    }}
-                  />
-                ))}
-              {!fno && searchQuery.isError && (
+              {searching && searchQuery.isFetching && hits.length === 0 && (
+                <p className="p-2 text-[11px] text-muted-foreground">Searching every exchange…</p>
+              )}
+              {searching && searchQuery.isError && (
                 <button
                   type="button"
                   onClick={() => void searchQuery.refetch()}
@@ -367,27 +274,44 @@ export function HedgingTopBar(props: Props) {
                   <RefreshCw className="h-3 w-3" /> Search failed — retry
                 </button>
               )}
-              {!fno && shownPicks.length === 0 && query.trim().length < 2 && (
-                <p className="p-2 text-[11px] text-muted-foreground">Type at least 2 characters…</p>
-              )}
-              {!fno &&
-                shownPicks.length === 0 &&
-                query.trim().length >= 2 &&
+              {searching &&
+                !searchQuery.isError &&
+                hits.map((row) => (
+                  <UnderlyingRow
+                    key={`${row.exchange}:${row.symbol}`}
+                    pick={{ symbol: row.symbol, exchange: row.exchange }}
+                    active={row.symbol === props.underlying}
+                    onPick={(chosen) => {
+                      props.onUnderlyingChange(chosen)
+                      setUnderlyingOpen(false)
+                    }}
+                  />
+                ))}
+              {searching &&
                 !searchQuery.isFetching &&
-                !searchQuery.isError && (
+                !searchQuery.isError &&
+                hits.length === 0 && (
                   <p className="p-2 text-[11px] text-muted-foreground">No match</p>
                 )}
+              {!searching && (
+                <p className="p-2 text-[10px] leading-4 text-muted-foreground">
+                  Type to search every exchange. An index or an F&O name opens the options board; a
+                  plain stock opens its own chart.
+                </p>
+              )}
             </div>
           </div>
         </PopoverContent>
       </Popover>
 
-      {/* Option expiry (auto = nearest) — the OPT caption stays under the
-          dropdown so the pair reads at a glance even after a date lands in
-          the trigger. Equity has no option chain, so the picker disappears
-          with the mode. */}
-      {fno && (
-        <div className="flex flex-col items-center gap-0.5">
+      {/* Option expiry — the OPT label sits BEFORE the dropdown, on its left,
+          so the pair reads as one control. Only an F&O workspace carries an
+          option chain. */}
+      {props.fno && (
+        <div className="flex items-center gap-1">
+          <span className="text-[8px] leading-none font-semibold tracking-widest text-muted-foreground">
+            OPT
+          </span>
           <ExpirySelect
             label="Opt"
             underlying={props.underlying}
@@ -396,16 +320,16 @@ export function HedgingTopBar(props: Props) {
             instrumenttype="options"
             onChange={props.onExpiryChange}
           />
-          <span className="text-[8px] leading-none font-semibold tracking-widest text-muted-foreground">
-            OPT
-          </span>
         </div>
       )}
 
-      {/* Futures expiry (charts default to the SPOT index, front month one
-          click away) with its FUT caption. */}
-      {fno && (
-        <div className="flex flex-col items-center gap-0.5">
+      {/* Futures expiry — same label-before shape, FUT; the charts default to
+          the SPOT index and every futures month sits one click away. */}
+      {props.fno && (
+        <div className="flex items-center gap-1">
+          <span className="text-[8px] leading-none font-semibold tracking-widest text-muted-foreground">
+            FUT
+          </span>
           <ExpirySelect
             label="Spot"
             underlying={props.underlying}
@@ -415,9 +339,6 @@ export function HedgingTopBar(props: Props) {
             withSpot
             onChange={props.onFuturesExpiryChange}
           />
-          <span className="text-[8px] leading-none font-semibold tracking-widest text-muted-foreground">
-            FUT
-          </span>
         </div>
       )}
 
@@ -451,16 +372,16 @@ export function HedgingTopBar(props: Props) {
           ₹
         </button>
       </div>
-      {PRODUCTS_FOR(fno).length > 1 && (
+      {PRODUCTS_FOR(props.fno).length > 1 && (
         <Button
           variant="outline"
           className="h-7 px-2 text-[11px] font-semibold"
           onClick={() => {
-            const list = PRODUCTS_FOR(fno)
+            const list = PRODUCTS_FOR(props.fno)
             const next = list[(list.indexOf(props.product as HedgingProduct) + 1) % list.length]
             props.onProductChange(next)
           }}
-          title={`Product ${props.product} — click for ${nextProduct(fno, props.product)}`}
+          title={`Product ${props.product} — click for ${nextProduct(props.fno, props.product)}`}
         >
           {props.product}
         </Button>
@@ -543,7 +464,7 @@ export function HedgingTopBar(props: Props) {
   )
 }
 
-/** One picker row: symbol + its exchange (a pinned default shows its pin). */
+/** One picker row: symbol + its exchange (a pinned index shows its pin). */
 function UnderlyingRow(props: {
   pick: UnderlyingPick
   active: boolean

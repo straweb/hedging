@@ -194,6 +194,16 @@ export interface PaneQuickTrade {
   onSecondary(): void
 }
 
+/** One host-managed marker line on a pane's price chart. */
+export interface PanePriceLine {
+  id: string
+  price: number
+  color: string
+  label?: string
+  badge?: string
+  dotted?: boolean
+}
+
 interface Props {
   /** Undefined keeps the local toolbar; null waits for the shared host. */
   toolbarHost?: HTMLElement | null
@@ -214,6 +224,12 @@ interface Props {
   toolbarCompact?: boolean
   /** Docked Deploy CE/PE (or Buy/Sell) pair for quote-only panes. */
   quickTrade?: PaneQuickTrade
+  /**
+   * Horizontal marker lines synced onto this pane's price chart — an open
+   * position's entry and its monitoring levels. The pane diffs them by id;
+   * a symbol change swaps the list and the stale lines drop off.
+   */
+  priceLines?: PanePriceLine[]
   paneLabel?: string
   /** Stable pane id — namespaces the pane's persisted symbol/interval/type. */
   paneId: string
@@ -313,6 +329,7 @@ export function ChartPane({
   /** Icon-only toolbar: labels hidden, floating band, a real (thin) scrollbar. */
   toolbarCompact = false,
   quickTrade,
+  priceLines,
   onInitialized,
   onInitializationError,
   onWorkspaceChange,
@@ -720,6 +737,19 @@ export function ChartPane({
     if (sharedLatch === undefined || (initialWorkspacePane && !preparedRef.current)) return
     terminalRef.current?.setDrawLatch(sharedLatch)
   }, [sharedLatch, initialWorkspacePane])
+
+  /* ── sync the host's marker lines (position entry / target / SL) ──────── */
+  // The pane diffs by id, so a ticking average price moves its line instead
+  // of stacking; a symbol change hands over a shorter list and the stale
+  // lines drop. Unset prop = the pane owns no lines, touch nothing. `ready`
+  // rides in the deps so the first list is not skipped by the not-yet-built
+  // guard and then never re-run. A chart rebuild strands the old
+  // primitives; the terminal's own chart guard restarts the layer fresh.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: ready is the trigger — the first list syncs once the build lands
+  useEffect(() => {
+    if (priceLines === undefined || (initialWorkspacePane && !preparedRef.current)) return
+    terminalRef.current?.setPriceLines(priceLines)
+  }, [priceLines, initialWorkspacePane, ready])
   /* ── follow the page-level One-Click switch ───────────────────────────── */
   useEffect(() => {
     terminalRef.current?.setWorkspaceTransitionLocked(transitionLocked)
@@ -1156,14 +1186,14 @@ export function ChartPane({
           // height with the controls row.
           className={cn(
             'flex min-w-0 flex-1 flex-nowrap items-center gap-0.5 overflow-x-auto px-1',
-          //   toolbarCompact ? 'h-10 scrollbar-thin' : 'no-scrollbar h-10',
-          //   (toolbarHost === undefined || fullscreen) && 'oa-terminal-band border-b'
-          // )}
-          // className={cn(
-          //   'flex h-10 min-w-0 flex-nowrap items-center gap-0.5 no-scrollbar overflow-x-auto px-1',
-          //   (toolbarHost === undefined || fullscreen) && 'oa-terminal-band border-b'
-          // )}
-          toolbarCompact
+            //   toolbarCompact ? 'h-10 scrollbar-thin' : 'no-scrollbar h-10',
+            //   (toolbarHost === undefined || fullscreen) && 'oa-terminal-band border-b'
+            // )}
+            // className={cn(
+            //   'flex h-10 min-w-0 flex-nowrap items-center gap-0.5 no-scrollbar overflow-x-auto px-1',
+            //   (toolbarHost === undefined || fullscreen) && 'oa-terminal-band border-b'
+            // )}
+            toolbarCompact
               ? 'absolute inset-x-2 top-2 z-20 h-8 rounded-lg border bg-popover/92 shadow-md backdrop-blur scrollbar-thin'
               : 'no-scrollbar h-10',
             !toolbarCompact &&
@@ -1368,22 +1398,22 @@ export function ChartPane({
             Compact grids drop it: the dense layout trades from the side panels
             and the dock, and the field was the widest fixed item in the row. */}
           {!toolbarCompact && (
-          <div className="flex shrink-0 items-center gap-1.5 pl-1">
-            <label
-              className="whitespace-nowrap text-[11px] font-medium text-muted-foreground"
-              htmlFor={`qty-${paneId}`}
-            >
-              {sym?.lots ? 'Lots' : 'Qty'}
-            </label>
-            <Input
-              id={`qty-${paneId}`}
-              type="number"
-              min={1}
-              value={qty}
-              onChange={(e) => changeQty(Number(e.target.value))}
-              className="h-7 w-16 rounded-md border-transparent bg-foreground/[0.06] px-2 text-[13px] font-medium tabular-nums shadow-none hover:bg-foreground/[0.09] focus-visible:border-ring dark:bg-foreground/[0.07]"
-            />
-          </div>
+            <div className="flex shrink-0 items-center gap-1.5 pl-1">
+              <label
+                className="whitespace-nowrap text-[11px] font-medium text-muted-foreground"
+                htmlFor={`qty-${paneId}`}
+              >
+                {sym?.lots ? 'Lots' : 'Qty'}
+              </label>
+              <Input
+                id={`qty-${paneId}`}
+                type="number"
+                min={1}
+                value={qty}
+                onChange={(e) => changeQty(Number(e.target.value))}
+                className="h-7 w-16 rounded-md border-transparent bg-foreground/[0.06] px-2 text-[13px] font-medium tabular-nums shadow-none hover:bg-foreground/[0.09] focus-visible:border-ring dark:bg-foreground/[0.07]"
+              />
+            </div>
           )}
 
           <ToolbarDivider />

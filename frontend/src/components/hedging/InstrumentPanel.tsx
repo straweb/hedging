@@ -12,7 +12,9 @@ import {
 } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { scalpingApi } from '@/api/scalping'
+import { LtpSparkline } from '@/components/hedging/LtpSparkline'
 import { PercentField } from '@/components/hedging/PercentField'
+import { SessionRangeBar } from '@/components/hedging/SessionRangeBar'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -109,6 +111,10 @@ export interface InstrumentPanelProps {
   sideCapital: number
   sideMode: SideMode
   getLtp(row: HedgingInstrument): number | undefined
+  /** The session's low/high marks for the row's quote (range rail). */
+  getSessionRange?(row: HedgingInstrument): { low?: number; high?: number }
+  /** The row's accumulated LTP tape (open-position sparkline). */
+  getLtpHistory?(row: HedgingInstrument): number[]
   positionsBySymbol: Map<string, Position>
   pendingBySymbol: Map<string, Order>
   busyIds: Set<string>
@@ -344,6 +350,25 @@ function StrikeRow(props: InstrumentPanelProps & { row: HedgingInstrument }) {
         : 'rgba(239, 68, 68, 0.85)'
   const edge = isOption && props.side === 'PE' ? 'borderRight' : 'borderLeft'
 
+  // The sparkline's levels: the fill's average price and whatever monitoring
+  // levels the row carries — dotted rules across the tape, exactly what the
+  // chart shows as marker lines for the same position.
+  const tape = hasPosition ? (props.getLtpHistory?.(row) ?? []) : []
+  const tapeLevels = useMemo(() => {
+    if (!hasPosition) return []
+    const levels: Array<{ price: number; color: string; label: string }> = []
+    if (position && position.average_price > 0)
+      levels.push({
+        price: position.average_price,
+        color: position.quantity > 0 ? '#10b981' : '#ef4444',
+        label: 'ENT',
+      })
+    if (row.target != null) levels.push({ price: row.target, color: '#10b981', label: 'TGT' })
+    if (row.stoploss != null) levels.push({ price: row.stoploss, color: '#ef4444', label: 'SL' })
+    return levels
+  }, [hasPosition, position, row.target, row.stoploss])
+  const range = props.getSessionRange?.(row)
+
   return (
     <div
       className={cn(
@@ -356,6 +381,9 @@ function StrikeRow(props: InstrumentPanelProps & { row: HedgingInstrument }) {
         {
           [edge]: `3px solid ${accent}`,
           [`${edge}Width`]: 3,
+          // An open position closes the box: the top border joins the side
+          // accents, so held rows read as framed at a glance.
+          ...(hasPosition ? { borderTop: `3px solid ${accent}` } : {}),
         } as React.CSSProperties
       }
     >
@@ -569,6 +597,25 @@ function StrikeRow(props: InstrumentPanelProps & { row: HedgingInstrument }) {
           </div>
         </div>
       )}
+      {/* Line 3: the session's range with the live quote on it — every row —
+          and, for open positions, the LTP tape against its dotted levels. */}
+      <div className="mt-1 flex items-center gap-1.5">
+        <SessionRangeBar
+          low={range?.low}
+          high={range?.high}
+          ltp={ltp}
+          className="h-1 min-w-0 flex-1"
+        />
+        {hasPosition && tape.length >= 2 && tapeLevels.length > 0 && (
+          <LtpSparkline
+            points={tape}
+            levels={tapeLevels}
+            width={84}
+            height={20}
+            className="shrink-0 text-muted-foreground"
+          />
+        )}
+      </div>
     </div>
   )
 }

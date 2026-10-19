@@ -3,8 +3,9 @@ import type {
   HedgingState,
   HedgingWorkspaceTab,
   ScheduledOrder,
+  TabKind,
 } from '@/types/hedging'
-import { emptyTabContext, makeInstrumentId } from '@/types/hedging'
+import { emptyTabContext, FNO_EXCHANGES, makeInstrumentId } from '@/types/hedging'
 
 /**
  * localStorage persistence for the hedging terminal.
@@ -21,13 +22,16 @@ import { emptyTabContext, makeInstrumentId } from '@/types/hedging'
  *   carries its own market. The tab that was active inherits the old
  *   global context; other tabs start empty rather than silently trading
  *   a market the trader did not give them.
+ * - v3 → v4: the global F&O/Equity mode is gone — every tab carries its
+ *   own `kind` ('fno' | 'stock'), derived from its home exchange (a
+ *   derivative exchange means an F&O market) and, for the tab that was
+ *   active, from the old global mode when its exchange does not decide.
  */
 
 export const HEDGING_STORAGE_KEY = 'openalgo.hedging.v1'
 
 export const DEFAULT_STATE: HedgingState = {
-  version: 3,
-  mode: 'fno',
+  version: 4,
   capital: 100000,
   capitalSource: 'fixed',
   capitalPercent: 25,
@@ -44,8 +48,11 @@ export const DEFAULT_STATE: HedgingState = {
   activeTabId: 'ws-1',
 }
 
-function defaultTab(): HedgingWorkspaceTab {
-  return { ...emptyTabContext('ws-1', 'W1', 'single', 'NFO'), underlying: 'NIFTY' }
+function defaultTab(kind: TabKind = 'fno'): HedgingWorkspaceTab {
+  return {
+    ...emptyTabContext('ws-1', 'W1', 'single', kind, kind === 'fno' ? 'NFO' : 'NSE'),
+    underlying: kind === 'fno' ? 'NIFTY' : '',
+  }
 }
 
 const WORKSPACE_PREFIX = 'ws-'
@@ -60,6 +67,8 @@ export function makeOptionRow(input: {
   strike: number
   optionType: 'CE' | 'PE'
   lotSize: number
+  /** Initial weight before the side normalizes (0 splits in evenly). */
+  weight?: number
 }): HedgingInstrument {
   return {
     id: makeInstrumentId('option', input.symbol, input.exchange),
@@ -70,7 +79,7 @@ export function makeOptionRow(input: {
     optionType: input.optionType,
     lotSize: input.lotSize,
     enabled: true,
-    weight: 0, // normalizeWeights() splits 100 across whatever is enabled
+    weight: input.weight ?? 0,
     fixedAmount: 0,
     action: 'BUY',
     entry: null,
@@ -83,6 +92,7 @@ export function makeStockRow(input: {
   symbol: string
   exchange: string
   lotSize?: number
+  weight?: number
 }): HedgingInstrument {
   return {
     id: makeInstrumentId('stock', input.symbol, input.exchange),
@@ -91,7 +101,7 @@ export function makeStockRow(input: {
     exchange: input.exchange,
     lotSize: input.lotSize ?? 1,
     enabled: true,
-    weight: 0,
+    weight: input.weight ?? 0,
     fixedAmount: 0,
     action: 'BUY',
     entry: null,
@@ -114,7 +124,7 @@ function sanitizedScheduled(rows: unknown): ScheduledOrder[] {
       ...row,
       action: row.action,
       status:
-        row.status === 'done' || row.status === 'missed'
+        row.status === 'done' || row.status === 'missed' || row.status === 'canceled'
           ? (row.status as ScheduledOrder['status'])
           : ('pending' as const),
       createdAt: typeof row.createdAt === 'number' ? row.createdAt : 0,
@@ -150,12 +160,28 @@ function sanitizedList(rows: unknown): HedgingInstrument[] {
     }))
 }
 
-function sanitizedTab(tab: Partial<HedgingWorkspaceTab>, index: number): HedgingWorkspaceTab {
+/** A tab's kind: what it trades. A stored value wins; otherwise the home
+ * exchange decides — a derivative exchange is an F&O market, a cash exchange
+ * a plain stock. Only a tab with NO exchange at all (older than the split)
+ * inherits the legacy fallback, from the snapshot's old global mode. */
+function tabKind(tab: Partial<HedgingWorkspaceTab>, fallback: TabKind = 'fno'): TabKind {
+  if (tab.kind === 'fno' || tab.kind === 'stock') return tab.kind
+  if (!tab.exchange) return fallback
+  return FNO_EXCHANGES.has(tab.exchange) ? 'fno' : 'stock'
+}
+
+function sanitizedTab(
+  tab: Partial<HedgingWorkspaceTab>,
+  index: number,
+  fallbackKind: TabKind = 'fno'
+): HedgingWorkspaceTab {
+  const kind = tabKind(tab, fallbackKind)
   const base = emptyTabContext(
     tab.id ?? `ws-migrated-${index}`,
     typeof tab.name === 'string' && tab.name ? tab.name : `W${index + 1}`,
     typeof tab.layoutId === 'string' && tab.layoutId ? tab.layoutId : 'single',
-    typeof tab.exchange === 'string' && tab.exchange ? tab.exchange : 'NFO'
+    kind,
+    typeof tab.exchange === 'string' && tab.exchange ? tab.exchange : kind === 'fno' ? 'NFO' : 'NSE'
   )
   return {
     ...base,
@@ -170,22 +196,27 @@ function sanitizedTab(tab: Partial<HedgingWorkspaceTab>, index: number): Hedging
 /** Merge a (possibly older or partial) snapshot over the defaults. */
 export function hydrateState(raw: unknown): HedgingState {
   const source = (raw ?? {}) as Partial<HedgingState> & {
-    // v2 globals that v3 moved into the tabs.
+    // v2 globals that v3 moved into the tabs; v3's global mode that v4
+    // folded into each tab's kind.
     exchange?: string
     underlying?: string
     expiry?: string
     futuresExpiry?: string
     options?: HedgingInstrument[]
     stocks?: HedgingInstrument[]
+    mode?: 'fno' | 'equity'
     // v1 field, dropped in v2.
     capitalMode?: 'fixed' | 'percent'
   }
+  // v3 → v4: a tab with no exchange of its own (older than the split)
+  // inherits the old global mode's kind; every other tab reads its exchange.
+  const legacyKind: TabKind = source.mode === 'equity' ? 'stock' : 'fno'
   const rawTabs: HedgingWorkspaceTab[] = Array.isArray(source.tabs)
     ? source.tabs
         .filter((tab) => tab && typeof tab.id === 'string')
-        .map((tab, index) => sanitizedTab(tab as Partial<HedgingWorkspaceTab>, index))
+        .map((tab, index) => sanitizedTab(tab as Partial<HedgingWorkspaceTab>, index, legacyKind))
     : []
-  const tabs = rawTabs.length > 0 ? rawTabs : [defaultTab()]
+  const tabs = rawTabs.length > 0 ? rawTabs : [defaultTab(legacyKind)]
   const activeTabId = tabs.some((tab) => tab.id === source.activeTabId)
     ? (source.activeTabId as string)
     : tabs[0].id
@@ -212,8 +243,7 @@ export function hydrateState(raw: unknown): HedgingState {
   const capitalSource: HedgingState['capitalSource'] =
     (source.capitalSource ?? source.capitalMode) === 'percent' ? 'percent' : 'fixed'
   return {
-    version: 3,
-    mode: source.mode === 'equity' ? 'equity' : 'fno',
+    version: 4,
     capital:
       typeof source.capital === 'number' && source.capital > 0
         ? source.capital

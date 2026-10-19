@@ -1,4 +1,10 @@
-import { emptyTabContext, type HedgingWorkspaceTab } from '@/types/hedging'
+import {
+  emptyTabContext,
+  FNO_EXCHANGES,
+  fnoExchangeFor,
+  type HedgingWorkspaceTab,
+  type TabKind,
+} from '@/types/hedging'
 import { newTabId } from './storage'
 
 /**
@@ -7,14 +13,15 @@ import { newTabId } from './storage'
  * The rule the terminal lives by: a pick from the picker rows always opens a
  * brand-new workspace tab for that market — never a re-dress of an older tab,
  * whose layout the trader may have rebuilt since. The one exception is the
- * auto-pick that lands an exchange or mode switch: it adopts the pristine tab
- * that switch just cleared (no rows, no underlying), so the strip does not
- * accumulate a discarded tab every time the trader moves between exchanges.
+ * auto-pick that lands a programmatic adoption: it adopts the pristine tab
+ * that is active and empty (no rows, no underlying), so a scripted switch
+ * does not litter the strip with a discarded tab.
  *
- * An F&O tab is born with the spot + legs layout and flagged for auto-seed:
- * when its option chain snapshot lands, the untouched panes load the spot
- * chart, the ATM call and the ATM put. Equity tabs open single-pane and chart
- * the stock itself.
+ * What the pick builds depends on the KIND the pick resolved to, not a
+ * global switch: an F&O kind is born with the spot + legs layout and flagged
+ * for auto-seed — when its option chain snapshot lands, the untouched panes
+ * load the spot chart, the ATM call and the ATM put. A stock kind opens
+ * single-pane and charts the stock itself.
  */
 
 export type UnderlyingSource = 'user' | 'autopick'
@@ -26,6 +33,21 @@ export interface UnderlyingTabPlan {
   activeTabId: string
   /** The tab that should auto-seed spot + ATM CE/PE when its chain lands. */
   autoSeedTabId: string | null
+}
+
+/**
+ * Resolve what a pick trades: a derivative exchange is F&O by definition; a
+ * cash exchange (NSE/BSE) is F&O only when the symbol actually carries
+ * derivatives — answered by whether its option-expiry listing came back
+ * non-empty (`optionExpiries` null = the listing could not be asked, degrade
+ * to a plain stock chart, which every symbol has).
+ */
+export function pickKind(
+  pick: { symbol: string; exchange: string },
+  optionExpiries: string[] | null
+): TabKind {
+  if (FNO_EXCHANGES.has(pick.exchange)) return 'fno'
+  return optionExpiries != null && optionExpiries.length > 0 ? 'fno' : 'stock'
 }
 
 /** A tab name no other tab holds: "NIFTY", then "NIFTY 2", "NIFTY 3", … */
@@ -51,7 +73,7 @@ const adoptableTab = (previous: {
 export function planUnderlyingTabs(
   previous: { tabs: HedgingWorkspaceTab[]; activeTabId: string },
   pick: { symbol: string; exchange: string },
-  fnoMode: boolean,
+  kind: TabKind,
   source: UnderlyingSource = 'user'
 ): UnderlyingTabPlan {
   const adoptable = source === 'autopick' ? adoptableTab(previous) : undefined
@@ -60,7 +82,8 @@ export function planUnderlyingTabs(
     const adopted: HedgingWorkspaceTab = {
       ...adoptable,
       name: uniqueTabName(pick.symbol, rest),
-      layoutId: fnoMode ? 'spotLegs' : 'single',
+      layoutId: kind === 'fno' ? 'spotLegs' : 'single',
+      kind,
       exchange: pick.exchange,
       underlying: pick.symbol,
       expiry: '',
@@ -69,20 +92,23 @@ export function planUnderlyingTabs(
     return {
       tabs: previous.tabs.map((tab) => (tab.id === adoptable.id ? adopted : tab)),
       activeTabId: adopted.id,
-      autoSeedTabId: fnoMode ? adopted.id : null,
+      autoSeedTabId: kind === 'fno' ? adopted.id : null,
     }
   }
 
   const tab = emptyTabContext(
     newTabId(),
     uniqueTabName(pick.symbol, previous.tabs),
-    fnoMode ? 'spotLegs' : 'single',
-    pick.exchange
+    kind === 'fno' ? 'spotLegs' : 'single',
+    kind,
+    // A stock pick keeps its cash exchange; an F&O pick trades on the home
+    // derivative exchange of whatever the picker listed (BSE cash → BFO).
+    kind === 'fno' ? fnoExchangeFor(pick.exchange) : pick.exchange
   )
   tab.underlying = pick.symbol
   return {
     tabs: [...previous.tabs, tab],
     activeTabId: tab.id,
-    autoSeedTabId: fnoMode ? tab.id : null,
+    autoSeedTabId: kind === 'fno' ? tab.id : null,
   }
 }

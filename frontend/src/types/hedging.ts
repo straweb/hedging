@@ -10,6 +10,15 @@ import type { Order, Position, Trade } from '@/types/trading'
  * move; the dock and the quick actions turn it into multileg order batches.
  */
 
+/**
+ * The two workspace species. A tab is born one or the other — an F&O market
+ * (spot + legs layout, CALLS/PUTS panels, CE/PE vocabulary) or a plain stock
+ * (single chart, watchlist + stock panel, Buy/Sell vocabulary). There is no
+ * global switch: picking an underlying decides, per tab, by whether the
+ * symbol carries F&O derivatives.
+ */
+export type TabKind = 'fno' | 'stock'
+/** Vocabulary label kept for persisted scheduler rows (stock trades as equity). */
 export type Mode = 'fno' | 'equity'
 export type StrikeSide = 'CE' | 'PE'
 export type OrderSide = 'BUY' | 'SELL'
@@ -67,6 +76,17 @@ export function makeInstrumentId(kind: 'option' | 'stock', symbol: string, excha
   return `${kind}:${exchange}:${symbol}`
 }
 
+/** The exchanges that carry F&O derivatives (underlyings trade here). */
+export const FNO_EXCHANGES: ReadonlySet<string> = new Set(['NFO', 'BFO', 'MCX', 'CDS'])
+
+/** The home derivative exchange of a cash exchange (NSE→NFO, BSE→BFO). */
+export function fnoExchangeFor(exchange: string): string {
+  if (exchange === 'BSE') return 'BFO'
+  if (exchange === 'NFO' || exchange === 'BFO' || exchange === 'MCX' || exchange === 'CDS')
+    return exchange
+  return 'NFO'
+}
+
 /**
  * A workspace tab in the middle column. Each tab owns a LAYOUTS preset and —
  * since v3 — its own instrument context: the underlying it follows, its
@@ -79,7 +99,9 @@ export interface HedgingWorkspaceTab {
   name: string
   /** A LAYOUTS preset id from '@/lib/chart/layouts'. */
   layoutId: string
-  /** FNO: NFO | BFO | MCX | CDS. Equity: NSE | BSE. */
+  /** What this workspace trades — F&O market or plain stock. */
+  kind: TabKind
+  /** FNO: NFO | BFO | MCX | CDS. Stock: NSE | BSE (or the FNO home). */
   exchange: string
   underlying: string
   /** Options expiry, DDMMMYY as the API returns it. */
@@ -97,12 +119,14 @@ export function emptyTabContext(
   id: string,
   name: string,
   layoutId: string,
-  exchange = 'NFO'
+  kind: TabKind,
+  exchange = kind === 'fno' ? 'NFO' : 'NSE'
 ): HedgingWorkspaceTab {
   return {
     id,
     name,
     layoutId,
+    kind,
     exchange,
     underlying: '',
     expiry: '',
@@ -140,7 +164,12 @@ export type ScheduleTrigger =
       price: number
       price2?: number
     }
-export type ScheduleStatus = 'pending' | 'done' | 'missed'
+/**
+ * A canceled entry stays in the book as history — the row survives with its
+ * trigger and batch so the trader can see what was disarmed and re-arm a
+ * copy (Repeat) rather than reconstruct it from memory.
+ */
+export type ScheduleStatus = 'pending' | 'done' | 'missed' | 'canceled'
 
 /**
  * The strike-level plan an index-price deploy carries: which strikes to place
@@ -179,8 +208,7 @@ export interface ScheduledOrder {
 }
 
 export interface HedgingState {
-  version: 3
-  mode: Mode
+  version: 4
   /** Allocated capital, and whether it is a rupee amount or % of cash. */
   capital: number
   capitalSource: CapitalSource

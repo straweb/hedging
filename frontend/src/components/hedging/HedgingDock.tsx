@@ -93,6 +93,12 @@ interface Props {
   scheduledBusy: Set<string>
   /** FNO: the underlying whose constituents the Index tab breaks down. */
   underlying: string
+  /**
+   * The instrument the quick actions act on, shown on the strip so the
+   * buttons' target is never a guess: the spot index for the CE/PE batch,
+   * the stock itself for a Buy/Sell one.
+   */
+  actionSymbol: string | null
   /** The spot index quote target from the chain snapshot, when known. */
   indexSpot: { symbol: string; exchange: string } | null
   /** Load any symbol into the focused chart pane (Index tab rows). */
@@ -192,6 +198,18 @@ export function HedgingDock(props: Props) {
         <span className="mr-1 text-[10px] font-semibold tracking-wide text-muted-foreground">
           ACTIONS
         </span>
+        {props.actionSymbol && (
+          <span
+            className="max-w-[130px] truncate rounded border bg-muted/50 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-foreground"
+            title={
+              fno
+                ? `The CE/PE batches act on ${props.actionSymbol}'s option panels`
+                : `The Buy/Sell batches act on ${props.actionSymbol} (the stocks panel)`
+            }
+          >
+            on {props.actionSymbol}
+          </span>
+        )}
         {btn('deployA', `Deploy ${sideA}`, () => props.onDeploy('A'), 'green')}
         {btn('deployB', `Deploy ${sideB}`, () => props.onDeploy('B'), 'green')}
         {btn('closeA', `Close ${sideA}`, () => props.onCloseSide('A'), 'red')}
@@ -641,7 +659,8 @@ function ScheduledTable(props: {
                   'px-1 py-0 text-[9px]',
                   pending && 'bg-amber-500',
                   entry.status === 'done' && 'bg-emerald-600',
-                  entry.status === 'missed' && 'bg-muted text-muted-foreground'
+                  entry.status === 'missed' && 'bg-muted text-muted-foreground',
+                  entry.status === 'canceled' && 'bg-red-950 text-red-300'
                 )}
               >
                 {pending && entry.trigger.kind === 'time' && entry.trigger.repeat === 'daily'
@@ -665,7 +684,11 @@ function ScheduledTable(props: {
                   className="h-4 px-1.5 text-[9px]"
                   disabled={busy}
                   onClick={() => props.onEdit(entry)}
-                  title="Change the batch or the trigger"
+                  title={
+                    pending
+                      ? 'Change the batch or the trigger'
+                      : `Re-arm this ${entry.status} entry with changes`
+                  }
                 >
                   Edit
                 </Button>
@@ -675,7 +698,11 @@ function ScheduledTable(props: {
                   className="h-4 px-1.5 text-[9px]"
                   disabled={busy}
                   onClick={() => props.onRepeat(entry)}
-                  title="Arm a fresh copy of this entry"
+                  title={
+                    pending
+                      ? 'Arm a fresh copy of this entry'
+                      : `Arm a fresh copy of this ${entry.status} entry`
+                  }
                 >
                   Repeat
                 </Button>
