@@ -11,6 +11,8 @@ import sys
 import zipfile
 from pathlib import Path
 
+import requests
+
 os.environ.setdefault("API_KEY_PEPPER", "test-pepper-value-at-least-32-chars")
 os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 os.environ.setdefault("BROKER_API_KEY", "test-api-key")
@@ -35,6 +37,10 @@ class FakeResponse:
 
     def json(self):
         return self._body
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"HTTP {self.status_code}")
 
 
 # ----------------------------------------------------------------------
@@ -182,22 +188,18 @@ def test_get_api_response_folds_breeze_status_into_response_status(monkeypatch):
 
     captured = {}
 
-    def fake_request(method, url, headers=None, content=None):
-        captured["body"] = content
+    def fake_request(method, url, data=None, headers=None, timeout=None):
+        captured["method"] = method
+        captured["body"] = data
         return FakeResponse(200, {"Success": None, "Status": 401, "Error": "Invalid session."})
 
-    class FakeClient:
-        def get(self, url, headers=None, content=None):
-            return fake_request("GET", url, headers, content)
-
-        def post(self, url, headers=None, content=None):
-            return fake_request("POST", url, headers, content)
-
-    monkeypatch.setattr(breeze_client, "get_httpx_client", lambda: FakeClient())
+    monkeypatch.setattr(breeze_client.requests, "request", fake_request)
 
     response, data = request_raw("funds", "AUTH", "GET", "{}")
     assert data["Status"] == 401
     assert response.status == 401  # business failure surfaced on the response
+    assert captured["method"] == "GET"
+    assert captured["body"] == "{}"  # Breeze v1 carries a JSON body on GET too
 
 
 def test_authenticate_broker_success(monkeypatch):
@@ -205,17 +207,17 @@ def test_authenticate_broker_success(monkeypatch):
 
     session_token = breeze_client.encode_session_token("XY604721", "sessionkey")
 
-    class FakeClient:
-        def get(self, url, headers=None, content=None):
-            assert "customerdetails" in url
-            body = json.loads(content)
-            assert body["SessionToken"] == "apisession-123"
-            assert body["AppKey"] == "test-api-key"
-            return FakeResponse(
-                200, {"Success": {"session_token": session_token}, "Status": 200, "Error": None}
-            )
+    def fake_get(url, data=None, headers=None, timeout=None):
+        assert "customerdetails" in url
+        body = json.loads(data)
+        assert body["SessionToken"] == "apisession-123"
+        assert body["AppKey"] == "test-api-key"
+        assert headers["Content-Type"] == "application/json"
+        return FakeResponse(
+            200, {"Success": {"session_token": session_token}, "Status": 200, "Error": None}
+        )
 
-    monkeypatch.setattr(auth_api, "get_httpx_client", lambda: FakeClient())
+    monkeypatch.setattr(auth_api.requests, "get", fake_get)
 
     auth_token, error = auth_api.authenticate_broker("apisession-123")
     assert error is None
@@ -225,15 +227,29 @@ def test_authenticate_broker_success(monkeypatch):
 def test_authenticate_broker_failure(monkeypatch):
     import broker.icici.api.auth_api as auth_api
 
-    class FakeClient:
-        def get(self, url, headers=None, content=None):
-            return FakeResponse(200, {"Success": None, "Status": 401, "Error": "Invalid session."})
+    def fake_get(url, data=None, headers=None, timeout=None):
+        return FakeResponse(200, {"Success": None, "Status": 401, "Error": "Invalid session."})
 
-    monkeypatch.setattr(auth_api, "get_httpx_client", lambda: FakeClient())
+    monkeypatch.setattr(auth_api.requests, "get", fake_get)
 
     auth_token, error = auth_api.authenticate_broker("bad-session")
     assert auth_token is None
     assert "Invalid session" in error
+
+
+def test_authenticate_broker_rejects_malformed_token(monkeypatch):
+    import broker.icici.api.auth_api as auth_api
+
+    def fake_get(url, data=None, headers=None, timeout=None):
+        return FakeResponse(
+            200, {"Success": {"session_token": "not-base64-user:key"}, "Status": 200, "Error": None}
+        )
+
+    monkeypatch.setattr(auth_api.requests, "get", fake_get)
+
+    auth_token, error = auth_api.authenticate_broker("apisession-123")
+    assert auth_token is None
+    assert "malformed" in error.lower()
 
 
 # ----------------------------------------------------------------------
@@ -1035,3 +1051,569 @@ def test_untracked_room_is_dropped_silently():
     adapter = Adapter()
     adapter._on_stock(["4.1!999999", 1, 2, 3, 4, 5])
     assert adapter.published == []
+
+
+# ----------------------------------------------------------------------
+# GTT (gttorder endpoint)
+# ----------------------------------------------------------------------
+
+
+def _gtt_params(**overrides):
+    params = {
+        "stock_code": "CNXBAN",
+        "exchange_code": "NFO",
+        "product_type": "options",
+        "expiry_date": "2026-03-26T06:00:00.000Z",
+        "right": "call",
+        "strike_price": "69400",
+        "instrumenttype": "CE",
+    }
+    params.update(overrides)
+    return params
+
+
+def test_gtt_build_order_details_single(monkeypatch):
+    import broker.icici.mapping.gtt_data as gtt_mapping
+
+    legs = gtt_mapping.build_order_details(
+        {
+            "trigger_type": "SINGLE",
+            "action": "BUY",
+            "price": "1150",
+            "trigger_price": "1140",
+            "quantity": "30",
+        }
+    )
+    assert legs == [
+        {"action": "buy", "limit_price": "1150", "trigger_price": "1140.0"}
+    ]
+
+
+def test_gtt_build_order_details_oco_legs_ordered(monkeypatch):
+    import broker.icici.mapping.gtt_data as gtt_mapping
+
+    legs = gtt_mapping.build_order_details(
+        {
+            "trigger_type": "OCO",
+            "action": "SELL",
+            "quantity": "30",
+            "triggerprice_sl": "1100",
+            "triggerprice_tg": "1200",
+            "stoploss": "1090",
+            "target": "1210",
+        }
+    )
+    assert legs[0]["gtt_leg_type"] == "target"
+    assert legs[0]["trigger_price"] == "1200.0"
+    assert legs[0]["limit_price"] == "1210"
+    assert legs[1]["gtt_leg_type"] == "stoploss"
+    assert legs[1]["trigger_price"] == "1100.0"
+
+
+def test_gtt_build_order_details_oco_swaps_violated_invariant(monkeypatch):
+    import broker.icici.mapping.gtt_data as gtt_mapping
+
+    legs = gtt_mapping.build_order_details(
+        {
+            "trigger_type": "OCO",
+            "action": "SELL",
+            "quantity": "30",
+            "triggerprice_sl": "1300",
+            "triggerprice_tg": "1200",
+            "stoploss": "1310",
+            "target": "1190",
+        }
+    )
+    # After the swap the target leg still carries the higher trigger.
+    assert legs[0]["gtt_leg_type"] == "target"
+    assert float(legs[0]["trigger_price"]) == 1300.0
+    assert legs[0]["limit_price"] == "1310"
+    assert float(legs[1]["trigger_price"]) == 1200.0
+
+
+def test_gtt_place_order_builds_breeze_payload(monkeypatch):
+    import broker.icici.api.gtt_api as gtt_api
+
+    monkeypatch.setattr(gtt_api, "get_breeze_params", lambda s, e: _gtt_params())
+    monkeypatch.setattr(gtt_api, "get_symbol_info", lambda s, e: None)
+
+    captured = {}
+
+    def fake_request(endpoint, auth, method, payload):
+        captured["endpoint"] = endpoint
+        captured["method"] = method
+        captured["payload"] = json.loads(payload)
+        return FakeResponse(200, {}), {
+            "Success": {"gtt_order_id": "2026031900001234", "message": "placed"},
+            "Status": 200,
+            "Error": None,
+        }
+
+    monkeypatch.setattr(gtt_api, "request_raw", fake_request)
+
+    data = {
+        "symbol": "BANKNIFTY26MAR2669400CE",
+        "exchange": "NFO",
+        "trigger_type": "OCO",
+        "action": "SELL",
+        "product": "NRML",
+        "quantity": "30",
+        "pricetype": "LIMIT",
+        "price": "1150",
+        "triggerprice_sl": "1100",
+        "triggerprice_tg": "1200",
+        "stoploss": "1090",
+        "target": "1210",
+        "strategy": "Test",
+    }
+    res, response_data, trigger_id = gtt_api.place_gtt_order(data, "AUTH")
+
+    assert trigger_id == "2026031900001234"
+    assert res.status == 200
+    assert captured["endpoint"] == "gttorder"
+    assert captured["method"] == "POST"
+    payload = captured["payload"]
+    assert payload["gtt_type"] == "oco"
+    assert payload["index_or_stock"] == "index"  # CNXBAN is an index code
+    assert payload["stock_code"] == "CNXBAN"
+    assert payload["expiry_date"] == "2026-03-26T06:00:00.000Z"
+    assert payload["right"] == "call"
+    assert payload["strike_price"] == "69400"
+    assert payload["quantity"] == "30"
+    assert len(payload["order_details"]) == 2
+
+
+def test_gtt_place_order_failure_has_no_trigger_id(monkeypatch):
+    import broker.icici.api.gtt_api as gtt_api
+
+    monkeypatch.setattr(gtt_api, "get_breeze_params", lambda s, e: _gtt_params())
+    monkeypatch.setattr(gtt_api, "get_symbol_info", lambda s, e: None)
+    monkeypatch.setattr(
+        gtt_api,
+        "request_raw",
+        lambda e, a, m, p: (
+            FakeResponse(400, {}),
+            {"Success": None, "Status": 400, "Error": "GTT rejected"},
+        ),
+    )
+
+    res, response_data, trigger_id = gtt_api.place_gtt_order(
+        {
+            "symbol": "BANKNIFTY26MAR2669400CE",
+            "exchange": "NFO",
+            "trigger_type": "SINGLE",
+            "action": "BUY",
+            "quantity": "30",
+            "pricetype": "LIMIT",
+            "price": "1150",
+            "trigger_price": "1140",
+        },
+        "AUTH",
+    )
+    assert trigger_id is None
+    assert res.status == 400
+
+
+def _gtt_book_row(gtt_order_id="2026031900001234", exchange="NFO", status="Active"):
+    return {
+        "order_details": [
+            {
+                "gtt_leg_type": "Target",
+                "action": "Sell",
+                "trigger_price": 1200.0,
+                "limit_price": 1210.0,
+                "status": status,
+                "gtt_order_id": gtt_order_id,
+            }
+        ],
+        "exchange_code": exchange,
+        "product_type": "Options",
+        "stock_code": "CNXBAN",
+        "expiry_date": "26-Mar-2026",
+        "strike_price": 69400.0,
+        "right": "Call",
+        "quantity": 30,
+        "index_or_stock": "Index",
+        "gtt_type": "Single",
+        "fresh_order_id": None,
+        "order_datetime": "19-MAR-2026 10:15:00",
+    }
+
+
+def test_gtt_book_map_normalizes_rows(monkeypatch):
+    import broker.icici.mapping.gtt_data as gtt_mapping
+
+    rows = [
+        _gtt_book_row(status="Active"),
+        _gtt_book_row(gtt_order_id="2", status="Cancelled"),
+    ]
+    normalised = gtt_mapping.map_gtt_book(rows)
+
+    assert normalised[0]["trigger_id"] == "2026031900001234"
+    assert normalised[0]["trigger_type"] == "single"
+    assert normalised[0]["status"] == "active"
+    assert normalised[0]["exchange"] == "NFO"
+    assert normalised[0]["trigger_prices"] == [1200.0]
+    assert normalised[0]["legs"][0]["action"] == "SELL"
+    assert normalised[0]["legs"][0]["pricetype"] == "LIMIT"
+
+    assert normalised[1]["status"] == "cancelled"
+
+
+def test_gtt_book_filters_active_unless_history(monkeypatch):
+    import broker.icici.api.gtt_api as gtt_api
+
+    def fake_request(endpoint, auth, method, payload):
+        body = json.loads(payload)
+        # Only NFO answers with rows; the other exchanges come back empty.
+        rows = [_gtt_book_row()] if body["exchange_code"] == "NFO" else []
+        return FakeResponse(200, {}), {"Success": rows, "Status": 200, "Error": None}
+
+    monkeypatch.setattr(gtt_api, "request_raw", fake_request)
+
+    active, active_status = gtt_api.get_gtt_book("AUTH")
+    assert active_status == 200
+    assert active["status"] == "success"
+    assert len(active["data"]) == 1
+    assert active["data"][0]["trigger_id"] == "2026031900001234"
+
+    history, history_status = gtt_api.get_gtt_book("AUTH", include_history=True)
+    assert history_status == 200
+    assert history["status"] == "success"
+
+
+def test_gtt_cancel_recovers_exchange_from_book(monkeypatch):
+    import broker.icici.api.gtt_api as gtt_api
+
+    def fake_request(endpoint, auth, method, payload):
+        body = json.loads(payload)
+        if method == "GET":
+            rows = [_gtt_book_row()] if body["exchange_code"] == "NFO" else []
+            return FakeResponse(200, {}), {"Success": rows, "Status": 200, "Error": None}
+        assert method == "DELETE"
+        assert body == {"exchange_code": "NFO", "gtt_order_id": "2026031900001234"}
+        return FakeResponse(200, {}), {
+            "Success": {"message": "cancelled"},
+            "Status": 200,
+            "Error": None,
+        }
+
+    monkeypatch.setattr(gtt_api, "request_raw", fake_request)
+
+    message, status_code = gtt_api.cancel_gtt_order("2026031900001234", "AUTH")
+    assert status_code == 200
+    assert message["status"] == "success"
+
+
+def test_gtt_cancel_unknown_trigger_404(monkeypatch):
+    import broker.icici.api.gtt_api as gtt_api
+
+    monkeypatch.setattr(
+        gtt_api,
+        "request_raw",
+        lambda e, a, m, p: (FakeResponse(200, {}), {"Success": [], "Status": 200, "Error": None}),
+    )
+    message, status_code = gtt_api.cancel_gtt_order("9999", "AUTH")
+    assert status_code == 404
+    assert message["status"] == "error"
+
+
+# ----------------------------------------------------------------------
+# Margin calculator (margincalculator endpoint)
+# ----------------------------------------------------------------------
+
+
+def test_margin_transform_groups_by_exchange(monkeypatch):
+    import broker.icici.mapping.margin_data as margin_mapping
+
+    def fake_params(symbol, exchange):
+        if exchange == "NFO":
+            return _gtt_params()
+        return {
+            "stock_code": "TCS",
+            "exchange_code": "NSE",
+            "product_type": "cash",
+            "expiry_date": "",
+            "right": "",
+            "strike_price": "",
+            "instrumenttype": "EQ",
+        }
+
+    monkeypatch.setattr(margin_mapping, "get_breeze_params", fake_params)
+
+    positions = [
+        {
+            "symbol": "BANKNIFTY26MAR2669400CE",
+            "exchange": "NFO",
+            "action": "BUY",
+            "quantity": "30",
+            "pricetype": "LIMIT",
+            "product": "NRML",
+            "price": "577",
+        },
+        {
+            "symbol": "TCS",
+            "exchange": "NSE",
+            "action": "BUY",
+            "quantity": "10",
+            "pricetype": "LIMIT",
+            "product": "CNC",
+            "price": "4200",
+        },
+    ]
+    groups, cash_values, skipped = margin_mapping.transform_margin_positions(positions, "AUTH")
+
+    assert set(groups.keys()) == {"NFO"}
+    leg = groups["NFO"][0]
+    assert leg["stock_code"] == "CNXBAN"
+    assert leg["product"] == "options"
+    assert leg["action"] == "buy"
+    assert leg["price"] == "577.00"
+    assert leg["expiry_date"] == "26-Mar-2026"
+    assert leg["right"] == "call"
+
+    # The equity leg is valued at order value (10 * 4200).
+    assert cash_values == [("NSE", 42000.0, "TCS")]
+    assert skipped == []
+
+
+def test_margin_parse_response_aggregates(monkeypatch):
+    import broker.icici.mapping.margin_data as margin_mapping
+
+    responses = {
+        "NFO": {
+            "Success": {
+                "span_margin_required": "493011.26",
+                "non_span_margin_required": "1000.00",
+                "order_value": "493011.26",
+            },
+            "Status": 200,
+            "Error": None,
+        }
+    }
+    result = margin_mapping.parse_margin_response(responses, [("NSE", 42000.0, "TCS")])
+    assert result["status"] == "success"
+    assert result["data"]["total_margin_required"] == 536011.26
+    assert result["data"]["span_margin"] == 493011.26
+    assert result["data"]["exposure_margin"] == 1000.0
+
+
+def test_calculate_margin_api_success(monkeypatch):
+    import broker.icici.api.margin_api as margin_api
+
+    monkeypatch.setattr(
+        margin_api,
+        "transform_margin_positions",
+        lambda positions, auth: (
+            {"NFO": [{"stock_code": "CNXBAN"}]},
+            [],
+            [],
+        ),
+    )
+    monkeypatch.setattr(
+        margin_api,
+        "request_raw",
+        lambda endpoint, auth, method, payload: (
+            FakeResponse(200, {}),
+            {
+                "Success": {
+                    "span_margin_required": "1000.0",
+                    "non_span_margin_required": "100.0",
+                    "order_value": "1000.0",
+                },
+                "Status": 200,
+                "Error": None,
+            },
+        ),
+    )
+
+    res, response_data = margin_api.calculate_margin_api(
+        [{"symbol": "BANKNIFTY26MAR2669400CE", "exchange": "NFO"}], "AUTH"
+    )
+    assert res.status == 200
+    assert response_data["status"] == "success"
+    assert response_data["data"]["total_margin_required"] == 1100.0
+
+
+def test_calculate_margin_api_empty_positions(monkeypatch):
+    import broker.icici.api.margin_api as margin_api
+
+    res, response_data = margin_api.calculate_margin_api([], "AUTH")
+    assert res.status == 400
+    assert response_data["status"] == "error"
+
+
+# ----------------------------------------------------------------------
+# Order-update adapter (socket.io 'order' events)
+# ----------------------------------------------------------------------
+
+
+def _make_order_adapter():
+    """Stub the websocket_proxy base + order_adapter and import the module."""
+    import types
+
+    import threading
+
+    from utils.logging import get_logger
+
+    wp = types.ModuleType("websocket_proxy")
+    base = types.ModuleType("websocket_proxy.base_adapter")
+    mapping = types.ModuleType("websocket_proxy.mapping")
+    order_adapter = types.ModuleType("websocket_proxy.order_adapter")
+
+    class BaseBrokerWebSocketAdapter:
+        def __init__(self, use_shared_zmq=False, shared_publisher=None):
+            self.published = []
+
+        def _create_success_response(self, message, **kwargs):
+            d = {"status": "success", "message": message}
+            d.update(kwargs)
+            return d
+
+        def _create_error_response(self, code, message):
+            return {"status": "error", "code": code, "message": message}
+
+        def publish_market_data(self, topic, data):
+            self.published.append((topic, data))
+
+        def cleanup_zmq(self):
+            pass
+
+    class SymbolMapper:
+        @staticmethod
+        def get_token_from_symbol(symbol, exchange):
+            return None
+
+    class BaseOrderUpdateAdapter:
+        def __init__(self, broker_name, user_id):
+            self.broker_name = broker_name
+            self.user_id = user_id
+            self.logger = get_logger(f"order_adapter_{broker_name}")
+            self._lock = threading.Lock()
+            self._generation = 0
+            self._running = False
+            self._shutting_down = False
+            self._auth_rejected = False
+            self.published = []
+
+        def _is_current(self, generation):
+            return not self._shutting_down and self._generation == generation
+
+        def _publish_event_fields(self, fields):
+            fields.setdefault("broker", self.broker_name)
+            self.published.append(fields)
+
+    base.BaseBrokerWebSocketAdapter = BaseBrokerWebSocketAdapter
+    mapping.SymbolMapper = SymbolMapper
+    order_adapter.BaseOrderUpdateAdapter = BaseOrderUpdateAdapter
+    wp.base_adapter = base
+    wp.mapping = mapping
+    wp.order_adapter = order_adapter
+    sys.modules["websocket_proxy"] = wp
+    sys.modules["websocket_proxy.base_adapter"] = base
+    sys.modules["websocket_proxy.mapping"] = mapping
+    sys.modules["websocket_proxy.order_adapter"] = order_adapter
+
+    import broker.icici.streaming.icici_order_adapter as order_module
+
+    return order_module
+
+
+def _equity_tux():
+    """A TUX cash-order notification (messageType '4')."""
+    fields = [""] * 47
+    fields[0] = "src"
+    fields[11] = "4"
+    fields[13] = "NSE"
+    fields[14] = "TCS"
+    fields[15] = "B"  # orderFlow: Buy
+    fields[16] = "L"  # Limit
+    fields[17] = "T"  # Day
+    fields[18] = "4200.5"
+    fields[19] = "C"  # Cash
+    fields[20] = "E"  # Executed
+    fields[23] = "20260319N300001234"
+    fields[24] = "10"
+    fields[25] = "0"  # open qty
+    fields[26] = "10"  # executed qty
+    fields[30] = "0"  # stoploss trigger
+    fields[42] = "4199.75"
+    return fields
+
+
+def _derivative_tux():
+    """A TUX derivative-order notification (messageType '6')."""
+    fields = [""] * 47
+    fields[0] = "src"
+    fields[11] = "6"
+    fields[13] = "NFO"
+    fields[14] = "CNXBAN"
+    fields[15] = "O"  # Options
+    fields[16] = "C"  # Call
+    fields[18] = "69400"  # strike
+    fields[19] = "26-Mar-2026"
+    fields[21] = "S"  # Sell
+    fields[22] = "L"  # Limit
+    fields[24] = "238.5"
+    fields[25] = "O"  # Ordered
+    fields[26] = "20260319N300009999"
+    fields[27] = "30"
+    fields[28] = "0"
+    fields[29] = "0"
+    fields[30] = "0"
+    fields[31] = "0"
+    fields[39] = "0"
+    return fields
+
+
+def test_order_adapter_normalizes_equity_message():
+    order_module = _make_order_adapter()
+    adapter = order_module.IciciOrderUpdateAdapter(
+        user_id="openalgo-user", feed_user_id="XY604721", session_key="sessionkey"
+    )
+    fields = adapter.normalize(_equity_tux())
+    assert fields is not None
+    assert fields["orderid"] == "20260319N300001234"
+    assert fields["symbol"] == "TCS"
+    assert fields["exchange"] == "NSE"
+    assert fields["action"] == "BUY"
+    assert fields["quantity"] == 10
+    assert fields["price"] == 4200.5
+    assert fields["pricetype"] == "LIMIT"
+    assert fields["product"] == "CNC"
+    assert fields["order_status"] == "complete"
+    assert fields["filled_quantity"] == 10
+    assert fields["pending_quantity"] == 0
+    assert fields["average_price"] == 4199.75
+
+
+def test_order_adapter_normalizes_derivative_message():
+    order_module = _make_order_adapter()
+    adapter = order_module.IciciOrderUpdateAdapter(
+        user_id="openalgo-user", feed_user_id="XY604721", session_key="sessionkey"
+    )
+    fields = adapter.normalize(_derivative_tux())
+    assert fields is not None
+    assert fields["orderid"] == "20260319N300009999"
+    assert fields["exchange"] == "NFO"
+    assert fields["action"] == "SELL"
+    assert fields["quantity"] == 30
+    assert fields["price"] == 238.5
+    assert fields["pricetype"] == "LIMIT"
+    assert fields["product"] == "NRML"
+    assert fields["order_status"] == "open"
+
+
+def test_order_adapter_ignores_market_data_and_unknown_types():
+    order_module = _make_order_adapter()
+    adapter = order_module.IciciOrderUpdateAdapter(
+        user_id="openalgo-user", feed_user_id="XY604721", session_key="sessionkey"
+    )
+    # Room-framed market data is not an order message.
+    assert adapter.normalize(["4.1!11536", 1, 2, 3]) is None
+    # Unknown messageType.
+    unknown = _equity_tux()
+    unknown[11] = "9"
+    assert adapter.normalize(unknown) is None
+    # Too-short payload.
+    assert adapter.normalize(["src"]) is None

@@ -63,9 +63,6 @@ from broker.iiflcapital.streaming.iiflcapital_adapter import IiflcapitalWebSocke
 # Import the indmoney_adapter
 from broker.indmoney.streaming.indmoney_adapter import IndmoneyWebSocketAdapter
 
-# Import the icici_adapter
-from broker.icici.streaming.icici_adapter import IciciWebSocketAdapter
-
 # Import the fivepaisaxts_adapter
 from broker.jainamxts.streaming.jainamxts_adapter import JainamXTSWebSocketAdapter
 
@@ -122,6 +119,21 @@ from broker.hdfcsecurities.streaming.hdfcsecurities_adapter import (
     HDFCSecuritiesWebSocketAdapter,
 )
 
+# Import the icici_adapter
+# ICICI is an optional plugin: a partial/missing install (e.g. an
+# incomplete file copy) must never prevent app startup. Missing adapter
+# only disables ICICI live feeds — orders, GTT, portfolio keep working.
+try:
+    from broker.icici.streaming.icici_adapter import IciciWebSocketAdapter
+except Exception as icici_adapter_error:  # pragma: no cover - install guard
+    IciciWebSocketAdapter = None
+
+    logger.warning(
+        "ICICI broker plugin incomplete — live feeds disabled (%s). "
+        "Re-copy the full broker/icici/ folder from the release.",
+        icici_adapter_error,
+    )
+
 # AliceBlue adapter will be loaded dynamically
 
 # Register adapters
@@ -144,7 +156,6 @@ register_adapter("fyers", FyersWebSocketAdapter)
 register_adapter("definedge", DefinedgeWebSocketAdapter)
 register_adapter("paytm", PaytmWebSocketAdapter)
 register_adapter("indmoney", IndmoneyWebSocketAdapter)
-register_adapter("icici", IciciWebSocketAdapter)
 register_adapter("mstock", MstockWebSocketAdapter)
 register_adapter("motilal", MotilalWebSocketAdapter)
 register_adapter("jainamxts", JainamXTSWebSocketAdapter)
@@ -156,6 +167,13 @@ register_adapter("arrow", ArrowWebSocketAdapter)
 register_adapter("rupeezy", RupeezyWebSocketAdapter)
 register_adapter("hdfcsky", HDFCSkyWebSocketAdapter)
 register_adapter("hdfcsecurities", HDFCSecuritiesWebSocketAdapter)
+
+if IciciWebSocketAdapter is not None:
+    register_adapter("icici", IciciWebSocketAdapter)
+else:
+    logger.warning(
+        "Skipping websocket adapter registration for broker 'icici'"
+    )
 
 # AliceBlue adapter will be registered dynamically when first used
 
@@ -201,7 +219,6 @@ __all__ = [
     "DefinedgeWebSocketAdapter",
     "PaytmWebSocketAdapter",
     "IndmoneyWebSocketAdapter",
-    "IciciWebSocketAdapter",
     "MstockWebSocketAdapter",
     "MotilalWebSocketAdapter",
     "JainamXTSWebSocketAdapter",

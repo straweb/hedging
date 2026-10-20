@@ -1,0 +1,23 @@
+broker/icici/
+├── __init__.py
+├── plugin.json
+├── api/
+│   ├── __init__.py
+│   ├── auth_api.py
+│   ├── order_api.py
+│   ├── data.py
+│   └── funds.py
+├── mapping/
+│   ├── __init__.py
+│   ├── transform_data.py
+│   ├── order_data.py
+│   └── margin_data.py
+├── database/
+│   ├── __init__.py
+│   └── master_contract_db.py
+└── streaming/
+    ├── __init__.py
+    ├── icici_adapter.py
+    ├── icici_mapping.py
+    ├── icici_order_adapter.py
+    └── icici_websocket.py

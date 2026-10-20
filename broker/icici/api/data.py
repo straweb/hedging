@@ -1,72 +1,286 @@
-# api/data.py
-# Market data for the ICICI Direct Breeze API.
-#
-# Breeze enforces roughly one request per second on its quote and historical
-# chart endpoints, so every call passes through the shared rate limiter with
-# broker backpressure (BrokerBusyError under the gthread worker), matching
-# the dhan plugin's behaviour.
+"""
+ICICI Direct Breeze market-data APIs for OpenAlgo.
 
-import calendar
-import json
-import threading
-import time
-from datetime import datetime, timedelta
+``BrokerData`` exposes the common OpenAlgo market-data contract:
+
+    get_quotes(symbol, exchange)            -> dict
+    get_multiquotes(symbols)                -> list[dict]
+    get_depth(symbol, exchange)             -> dict (5 padded levels)
+    get_history(...)                        -> pandas DataFrame (epoch s)
+    get_option_chain(...)                   -> raw Breeze option-chain dict
+
+Breeze specifics handled here:
+
+- Quotes for F&O require the UNDERLYING stock code plus product_type /
+  expiry_date / right / strike_price — derived from the OpenAlgo symbol
+  (deterministic NIFTY19OCT2623650CE format) and the master contract.
+- Historical data uses the v2 ``historicalcharts`` endpoint (apikey +
+  X-SessionToken, query-string params). Only 1second / 1minute / 5minute /
+  30minute / 1day intervals exist, which is exactly what ``timeframe_map``
+  offers.
+- All REST traffic flows through breeze_client.breeze_request, so the
+  process-wide rate limiter and 429/503 backoff apply here too.
+"""
+
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
-from broker.icici.api.breeze_client import is_success, request_raw
-from broker.icici.mapping.transform_data import get_breeze_params
-from database.token_db import get_token
-from utils.broker_backpressure import BrokerBusyError, check_queue_wait
+from broker.icici.api.breeze_client import breeze_request, breeze_request_v2
+from broker.icici.api.baseurl import HIST_V2_URL
+from broker.icici.mapping.transform_data import (
+    parse_oa_symbol,
+    underlying_symbol,
+)
+from database.token_db import get_br_symbol, get_symbol_info
 from utils.logging import get_logger
+
 
 logger = get_logger(__name__)
 
-# Rate limiter: Breeze allows ~1 req/s on quotes and historical charts.
-_rate_limit_lock = threading.Lock()
-_last_api_call_time = {"quote": 0.0, "history": 0.0}
-ICICI_QUOTE_INTERVAL = 1.05
-ICICI_HISTORY_INTERVAL = 1.05
+
+HIST_ENDPOINT = "historicalcharts"
+
+# Intraday v2 windows are chunked conservatively.
+_INTRADAY_CHUNK_DAYS = 30
+_DAILY_CHUNK_DAYS = 365
 
 
-def _apply_rate_limit(category="quote"):
-    """Per-category spacing so bursts queue instead of erroring.
+class ICICIBreezeAPIError(Exception):
+    """Normalized ICICI Breeze market-data exception."""
 
-    Raises BrokerBusyError under the gthread worker when the reserved slot is
-    too far away; unbounded otherwise (eventlet / dev server).
+
+# ---------------------------------------------------------------------------
+# Exchange / symbol helpers
+# ---------------------------------------------------------------------------
+
+def _exchange_code(exchange) -> str:
     """
-    global _last_api_call_time
-    interval = ICICI_HISTORY_INTERVAL if category == "history" else ICICI_QUOTE_INTERVAL
-    sleep_time = 0
+    OpenAlgo exchange -> Breeze exchange code (lowercase).
+    """
 
-    with _rate_limit_lock:
-        current_time = time.time()
-        time_since_last_call = current_time - _last_api_call_time[category]
-        if time_since_last_call < interval:
-            sleep_time = interval - time_since_last_call
-        check_queue_wait(sleep_time, "data")
-        _last_api_call_time[category] = current_time + sleep_time
+    value = str(exchange or "").strip().upper()
 
-    if sleep_time > 0:
-        logger.debug(
-            f"Rate limiting ({category}): sleeping {sleep_time:.2f}s before Breeze API call"
-        )
-        time.sleep(sleep_time)
+    mapping = {
+        "NSE": "nse",
+        "BSE": "bse",
+        "NFO": "nfo",
+        "BFO": "bfo",
+        "MCX": "mcx",
+        "CDS": "cds",
+        "NSE_INDEX": "nse",
+        "BSE_INDEX": "bse",
+        "MCX_INDEX": "mcx",
+    }
+
+    return mapping.get(value, value.lower())
 
 
-def _num(value, default=0.0):
+def _is_index(exchange) -> bool:
+    return str(exchange or "").upper().endswith("_INDEX")
+
+
+def _is_derivative(exchange) -> bool:
+    return str(exchange or "").upper() in ("NFO", "BFO", "MCX")
+
+
+def _stock_code(symbol: str, exchange: str) -> str:
+    """
+    Broker stock code for a symbol. The master contract stores the raw
+    Breeze code in brsymbol; fall back to the symbol with the common
+    OpenAlgo suffixes stripped.
+    """
+
+    brsymbol = None
+
     try:
+        brsymbol = get_br_symbol(symbol, exchange)
+    except Exception:
+        brsymbol = None
+
+    if brsymbol:
+        return str(brsymbol)
+
+    text = str(symbol or "").strip()
+
+    for suffix in ("-EQ", "-BE", "-BZ", "-SM", "-ST"):
+        if text.endswith(suffix):
+            return text[: -len(suffix)]
+
+    return text
+
+
+def _quote_instrument(symbol: str, exchange: str) -> dict:
+    """
+    Build Breeze quote parameters for any instrument class.
+
+    - cash: stock_code + exchange_code (+ product_type cash for Breeze)
+    - F&O: underlying stock_code + product futures/options + expiry +
+      right + strike
+    - index: the index stock code on the parent exchange
+    """
+
+    exchange_upper = str(exchange or "").upper()
+
+    params: dict = {}
+
+    if _is_derivative(exchange_upper):
+        info = None
+
+        try:
+            info = get_symbol_info(symbol, exchange)
+        except Exception:
+            info = None
+
+        parsed = parse_oa_symbol(symbol) or {}
+
+        underlying = underlying_symbol(symbol, exchange)
+
+        instrumenttype = ""
+
+        if info is not None and getattr(info, "instrumenttype", None):
+            instrumenttype = str(info.instrumenttype).upper()
+
+        if not instrumenttype:
+            instrumenttype = str(parsed.get("instrumenttype") or "")
+
+        if instrumenttype in ("CE", "PE"):
+            product = "options"
+            right = "call" if instrumenttype == "CE" else "put"
+        elif instrumenttype == "FUT":
+            product = "futures"
+            right = ""
+        else:
+            product = "futures"
+            right = ""
+
+        expiry = str(parsed.get("expiry_iso") or "")
+
+        if not expiry and info is not None and getattr(info, "expiry", None):
+            expiry = str(info.expiry or "")
+
+        params["stock_code"] = underlying
+        params["product_type"] = product
+
+        if expiry:
+            params["expiry_date"] = expiry
+
+        if right:
+            params["right"] = right
+
+        strike = parsed.get("strike")
+
+        if strike in (None, "") and info is not None and getattr(info, "strike", None):
+            strike_value = float(info.strike)
+
+            strike = (
+                str(int(strike_value))
+                if strike_value.is_integer()
+                else str(strike_value)
+            )
+
+        if right and strike not in (None, ""):
+            params["strike_price"] = str(strike)
+
+        return params
+
+    stock_code = _stock_code(symbol, exchange)
+
+    params["stock_code"] = stock_code
+    if exchange == "NSE_INDEX":
+        params["exchange_code"] = "NSE"
+    else:
+        params["exchange_code"] = exchange
+
+
+    # Breeze accepts product_type cash for equities/indices; omit for
+    # robustness on indices where some scrips are not tagged Cash.
+    if not _is_index(exchange):
+        params["product_type"] = "cash"
+
+    return params
+
+
+def _number(value, default=0.0) -> float:
+    try:
+        if value is None or value == "":
+            return float(default)
+
         return float(value)
+
     except (TypeError, ValueError):
+        return float(default)
+
+
+def _integer(value, default=0) -> int:
+    try:
+        if value is None or value == "":
+            return int(default)
+
+        return int(float(value))
+
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _success_data(response) -> dict:
+    if not isinstance(response, dict):
+        return {}
+
+    success = response.get("Success")
+
+    if isinstance(success, dict):
+        return success
+
+    if isinstance(success, list) and success:
+        return success[0]
+
+    return {}
+
+
+def _success_list(response) -> list:
+    if not isinstance(response, dict):
+        return []
+
+    success = response.get("Success")
+
+    if isinstance(success, list):
+        return success
+
+    if isinstance(success, dict):
+        return [success]
+
+    return []
+
+
+def _first(data: dict, *keys, default=None):
+    if not isinstance(data, dict):
         return default
 
+    for key in keys:
+        value = data.get(key)
+
+        if value is not None and value != "":
+            return value
+
+    return default
+
+
+# ---------------------------------------------------------------------------
+# BrokerData
+# ---------------------------------------------------------------------------
 
 class BrokerData:
+    """ICICI Direct Breeze OpenAlgo market-data handler."""
+
     def __init__(self, auth_token):
-        """Initialize the ICICI Direct data handler with the session token."""
         self.auth_token = auth_token
-        # Breeze intraday resolutions. intervals_service exposes these keys.
+
+        # intervals_service intersects these keys with
+        # utils.constants.SUPPORTED_INTERVALS, so only Breeze-served
+        # intervals are listed.
         self.timeframe_map = {
+            "1s": "1second",
             "1m": "1minute",
             "5m": "5minute",
             "30m": "30minute",
@@ -74,305 +288,522 @@ class BrokerData:
         }
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Quotes
     # ------------------------------------------------------------------
 
-    def _quotes_payload(self, symbol, exchange):
-        """Build the quotes request body for an OpenAlgo symbol."""
-        params = get_breeze_params(symbol, exchange)
-        body = {
-            "stock_code": params["stock_code"],
-            "exchange_code": params["exchange_code"],
-        }
-        if params["product_type"]:
-            body["product_type"] = params["product_type"]
-        if params["expiry_date"]:
-            body["expiry_date"] = params["expiry_date"]
-        if params["right"]:
-            body["right"] = params["right"]
-        if params["strike_price"]:
-            body["strike_price"] = params["strike_price"]
-        return params, body
-
-    @staticmethod
-    def _extract_quote_row(data, exchange_code):
-        """Pick the quote row out of a Breeze quotes response.
-
-        BSE responses carry a preamble row, so the SDK reads data[1] there;
-        everywhere else data[0] is the instrument.
+    def get_quotes(self, symbol: str, exchange: str) -> dict:
         """
-        rows = data.get("Success")
-        if isinstance(rows, dict):
-            return rows
-        if isinstance(rows, list) and rows:
-            if exchange_code.upper() == "BSE" and len(rows) > 1:
-                return rows[1]
-            return rows[0]
-        return None
+        Normalized OpenAlgo quote:
 
-    @staticmethod
-    def _empty_history():
-        return pd.DataFrame(
-            columns=["timestamp", "open", "high", "low", "close", "volume", "oi"]
+            {ask, bid, high, low, ltp, open, prev_close, volume, oi}
+        """
+
+        params = _quote_instrument(symbol, exchange)
+
+        response = breeze_request(
+            self.auth_token,
+            "GET",
+            "quotes",
+            params,
         )
 
-    @staticmethod
-    def _parse_breeze_datetime(value, is_daily):
-        """Breeze datetime ("2025-02-03T09:21:00.000Z") -> IST epoch seconds."""
-        text = str(value or "")
+        success = _success_data(response)
+
+        if not success:
+            error = str(response.get("Error") or "") if isinstance(response, dict) else ""
+
+            raise ICICIBreezeAPIError(
+                error or f"No quote data for {symbol} on {exchange}"
+            )
+
+        return {
+            "ask": _number(
+                _first(success, "best_offer_price", "sPrice", "ask", "sell_price")
+            ),
+            "bid": _number(
+                _first(success, "best_bid_price", "bPrice", "bid", "buy_price")
+            ),
+            "high": _number(_first(success, "high", "HighPrice")),
+            "low": _number(_first(success, "low", "LowPrice")),
+            "ltp": _number(_first(success, "ltp", "last", "last_price", "last_trade_price")),
+            "open": _number(_first(success, "open", "OpenPrice")),
+            "prev_close": _number(
+                _first(success, "previous_close", "prev_close", "close", "ClosePrice")
+            ),
+            "volume": _integer(
+                _first(success, "total_quantity_traded", "volume", "ttq")
+            ),
+            "oi": _integer(
+                _first(success, "open_interest", "oi", "OI", "CurrOpenInterest")
+            ),
+        }
+
+    def get_multiquotes(self, symbols: list) -> list:
+        """
+        Sequential quotes (Breeze has no batch quote endpoint). The
+        module-level rate limiter inside breeze_request paces the loop;
+        a failed symbol does not discard the other results.
+        """
+
+        results = []
+
+        for item in symbols:
+            symbol = item.get("symbol")
+            exchange = item.get("exchange")
+
+            try:
+                data = self.get_quotes(symbol, exchange)
+
+                results.append(
+                    {
+                        "symbol": symbol,
+                        "exchange": exchange,
+                        "data": data,
+                    }
+                )
+
+            except Exception as exc:
+                logger.warning(
+                    "ICICI multiquote failed for %s:%s: %s",
+                    exchange,
+                    symbol,
+                    exc,
+                )
+
+                results.append(
+                    {
+                        "symbol": symbol,
+                        "exchange": exchange,
+                        "error": str(exc),
+                    }
+                )
+
+        return results
+
+    # ------------------------------------------------------------------
+    # Depth
+    # ------------------------------------------------------------------
+
+    def get_depth(self, symbol: str, exchange: str) -> dict:
+        """
+        Normalized five-level depth.
+
+        The Breeze REST quote carries only the best bid/offer; levels 2-5
+        are zero-padded to keep the OpenAlgo contract shape stable. Live
+        multi-level depth comes from the websocket stream.
+        """
+
+        params = _quote_instrument(symbol, exchange)
+
+        response = breeze_request(
+            self.auth_token,
+            "GET",
+            "quotes",
+            params,
+        )
+
+        success = _success_data(response)
+
+        if not success:
+            error = str(response.get("Error") or "") if isinstance(response, dict) else ""
+
+            raise ICICIBreezeAPIError(
+                error or f"No depth data for {symbol} on {exchange}"
+            )
+
+        best_bid = _number(
+            _first(success, "best_bid_price", "bPrice", "bid")
+        )
+
+        bid_qty = _integer(
+            _first(success, "best_bid_quantity", "bQty", "bid_quantity")
+        )
+
+        best_ask = _number(
+            _first(success, "best_offer_price", "sPrice", "ask")
+        )
+
+        ask_qty = _integer(
+            _first(success, "best_offer_quantity", "sQty", "ask_quantity")
+        )
+
+        bids = [{"price": best_bid, "quantity": bid_qty}]
+        asks = [{"price": best_ask, "quantity": ask_qty}]
+
+        while len(bids) < 5:
+            bids.append({"price": 0.0, "quantity": 0})
+
+        while len(asks) < 5:
+            asks.append({"price": 0.0, "quantity": 0})
+
+        ltp = _number(_first(success, "ltp", "last", "last_price"))
+
+        return {
+            "asks": asks,
+            "bids": bids,
+            "high": _number(_first(success, "high", "HighPrice")),
+            "low": _number(_first(success, "low", "LowPrice")),
+            "ltp": ltp,
+            "ltq": _integer(
+                _first(success, "last_traded_quantity", "ltq", "last_quantity")
+            ),
+            "oi": _integer(
+                _first(success, "open_interest", "oi", "OI")
+            ),
+            "open": _number(_first(success, "open", "OpenPrice")),
+            "prev_close": _number(
+                _first(success, "previous_close", "prev_close", "close", "ClosePrice")
+            ),
+            "totalbuyqty": bid_qty,
+            "totalsellqty": ask_qty,
+            "volume": _integer(
+                _first(success, "total_quantity_traded", "volume", "ttq")
+            ),
+        }
+
+    def get_market_depth(self, symbol: str, exchange: str) -> dict:
+        return self.get_depth(symbol, exchange)
+
+    # ------------------------------------------------------------------
+    # Historical data
+    # ------------------------------------------------------------------
+
+    def _history_chunk(
+        self,
+        stock_code: str,
+        exchange_code: str,
+        breeze_interval: str,
+        product_type: str,
+        expiry_date: str,
+        right: str,
+        strike_price: str,
+        chunk_start: datetime,
+        chunk_end: datetime,
+    ) -> list:
+        params = {
+            "interval": breeze_interval,
+            "from_date": chunk_start.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "to_date": chunk_end.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "stock_code": stock_code,
+            "exch_code": exchange_code,
+            "product_type": product_type,
+        }
+
+        if expiry_date:
+            params["expiry_date"] = expiry_date
+
+        if right:
+            params["right"] = right
+
+        if strike_price:
+            params["strike_price"] = strike_price
+
+        response = breeze_request_v2(self.auth_token, HIST_ENDPOINT, params)
+
+        candles = _success_list(response)
+
+        if not candles and isinstance(response, dict):
+            error = str(response.get("Error") or "")
+
+            if error and "no data" not in error.lower():
+                raise ICICIBreezeAPIError(error)
+
+        return candles
+
+    def get_history(
+        self,
+        symbol: str,
+        exchange: str,
+        timeframe: str,
+        from_date,
+        to_date,
+    ) -> pd.DataFrame:
+        """
+        Normalized history DataFrame:
+
+            [timestamp, open, high, low, close, volume, oi]
+
+        ``timestamp`` is true epoch seconds; intraday candles are IST
+        wall-clock instants (standard Indian-broker convention).
+        """
+
+        columns = [
+            "timestamp",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "oi",
+        ]
+
+        breeze_interval = self.timeframe_map.get(timeframe)
+
+        if not breeze_interval:
+            raise ICICIBreezeAPIError(
+                f"Unsupported timeframe: {timeframe}. "
+                f"Supported: {', '.join(self.timeframe_map)}"
+            )
+
         try:
-            if is_daily:
-                # Anchor daily bars to IST midnight of the bar's date.
-                day = datetime.strptime(text[:10], "%Y-%m-%d")
-                return int(day.timestamp() + 19800)
-            utc_dt = datetime.strptime(text[:19], "%Y-%m-%dT%H:%M:%S")
-            return int(calendar.timegm(utc_dt.timetuple())) + 19800
-        except (ValueError, TypeError):
+            params = _quote_instrument(symbol, exchange)
+
+            stock_code = params.get("stock_code", "")
+
+            if not stock_code:
+                raise ICICIBreezeAPIError(
+                    f"Cannot resolve stock code for {symbol} on {exchange}"
+                )
+
+            exchange_code = _exchange_code(exchange)
+
+            product_type = str(params.get("product_type") or "")
+
+            if not product_type:
+                if _is_derivative(exchange):
+                    product_type = "futures"
+                else:
+                    product_type = "cash"
+
+            expiry_date = str(params.get("expiry_date") or "")
+            right = str(params.get("right") or "")
+            strike_price = str(params.get("strike_price") or "")
+
+            start = self._normalize_date(from_date, end_of_day=False)
+            end = self._normalize_date(to_date, end_of_day=True)
+
+            now = datetime.now()
+
+            if end > now:
+                end = now
+
+            if end <= start:
+                return pd.DataFrame(columns=columns)
+
+            if breeze_interval == "1day":
+                chunk_days = _DAILY_CHUNK_DAYS
+            else:
+                chunk_days = _INTRADAY_CHUNK_DAYS
+
+            candles: list = []
+
+            cursor = start
+
+            while cursor < end:
+                chunk_end = min(cursor + timedelta(days=chunk_days), end)
+
+                candles.extend(
+                    self._history_chunk(
+                        stock_code,
+                        exchange_code,
+                        breeze_interval,
+                        product_type,
+                        expiry_date,
+                        right,
+                        strike_price,
+                        cursor,
+                        chunk_end,
+                    )
+                )
+
+                cursor = chunk_end + timedelta(seconds=1)
+
+            return self._candles_to_dataframe(candles, columns)
+
+        except ICICIBreezeAPIError:
+            raise
+
+        except Exception as exc:
+            logger.exception("Error fetching ICICI historical data")
+
+            raise ICICIBreezeAPIError(
+                f"Error fetching historical data: {exc}"
+            ) from exc
+
+    @staticmethod
+    def _normalize_date(value, end_of_day: bool = False) -> datetime:
+        if isinstance(value, datetime):
+            parsed = value
+        elif isinstance(value, str):
+            text = value.strip().strip("\"'")
+
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+
+            try:
+                parsed = datetime.fromisoformat(text)
+            except ValueError:
+                parsed = datetime.strptime(text[:10], "%Y-%m-%d")
+        else:
+            parsed = datetime.combine(value, datetime.min.time())
+
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+
+        if end_of_day and parsed.time() == datetime.min.time():
+            parsed = parsed.replace(hour=23, minute=59, second=59)
+
+        return parsed
+
+    @staticmethod
+    def _timestamp_to_epoch(value) -> int | None:
+        if value is None:
             return None
 
-    def _history_chunk(self, params, interval, start_date, end_date):
-        """One historical-charts request for a date range; returns a DataFrame."""
-        body = {
-            "interval": interval,
-            "from_date": start_date,
-            "to_date": end_date,
-            "stock_code": params["stock_code"],
-            "exchange_code": params["exchange_code"],
-        }
-        if params["product_type"]:
-            body["product_type"] = params["product_type"]
-        if params["expiry_date"]:
-            body["expiry_date"] = params["expiry_date"]
-        if params["right"]:
-            body["right"] = params["right"]
-        if params["strike_price"]:
-            body["strike_price"] = params["strike_price"]
+        if isinstance(value, (int, float)):
+            return int(value)
 
-        _apply_rate_limit("history")
-        data = request_raw(
-            "historicalcharts", self.auth_token, "GET", json.dumps(body, separators=(",", ":"))
-        )[1]
+        text = str(value).strip()
 
-        if not is_success(data):
-            error = data.get("Error") if isinstance(data, dict) else str(data)
-            raise Exception(f"Error fetching historical data: {error or 'unknown error'}")
+        if not text:
+            return None
 
-        rows = data.get("Success") or []
-        is_daily = interval == "day"
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
 
-        records = []
-        for row in rows:
-            if not isinstance(row, dict):
+        parsed = None
+
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            pass
+
+        if parsed is None:
+            for fmt in (
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%d %H:%M",
+                "%Y-%m-%d",
+            ):
+                try:
+                    parsed = datetime.strptime(text, fmt)
+                    break
+                except ValueError:
+                    continue
+
+        if parsed is None:
+            coerced = pd.to_datetime(value, errors="coerce")
+
+            if pd.isna(coerced):
+                return None
+
+            parsed = coerced.to_pydatetime()
+
+        if parsed.tzinfo is None:
+            try:
+                from zoneinfo import ZoneInfo
+
+                parsed = parsed.replace(tzinfo=ZoneInfo("Asia/Kolkata"))
+            except Exception:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+
+        return int(parsed.timestamp())
+
+    @classmethod
+    def _candles_to_dataframe(
+        cls,
+        candles: list,
+        columns: list,
+    ) -> pd.DataFrame:
+        if not candles:
+            return pd.DataFrame(columns=columns)
+
+        rows = []
+
+        for candle in candles:
+            if not isinstance(candle, dict):
                 continue
-            timestamp = self._parse_breeze_datetime(row.get("datetime"), is_daily)
+
+            timestamp = cls._timestamp_to_epoch(
+                _first(candle, "datetime", "timestamp", "time", "date")
+            )
+
             if timestamp is None:
                 continue
-            records.append(
+
+            rows.append(
                 {
                     "timestamp": timestamp,
-                    "open": _num(row.get("open")),
-                    "high": _num(row.get("high")),
-                    "low": _num(row.get("low")),
-                    "close": _num(row.get("close")),
-                    "volume": _num(row.get("volume")),
-                    "oi": _num(row.get("open_interest") or row.get("oi")),
+                    "open": _number(_first(candle, "open")),
+                    "high": _number(_first(candle, "high")),
+                    "low": _number(_first(candle, "low")),
+                    "close": _number(_first(candle, "close")),
+                    "volume": _integer(
+                        _first(candle, "volume", "total_quantity_traded", "ttq")
+                    ),
+                    "oi": _integer(
+                        _first(candle, "open_interest", "oi", "OI")
+                    ),
                 }
             )
 
-        return pd.DataFrame(records, columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
+        if not rows:
+            return pd.DataFrame(columns=columns)
+
+        dataframe = pd.DataFrame(rows, columns=columns)
+
+        dataframe = (
+            dataframe.sort_values("timestamp")
+            .drop_duplicates(subset=["timestamp"], keep="last")
+            .reset_index(drop=True)
+        )
+
+        return dataframe
 
     # ------------------------------------------------------------------
-    # Public API
+    # Option chain
     # ------------------------------------------------------------------
 
-    def get_history(self, symbol, exchange, interval, start_date, end_date):
-        """Historical bars as the shared DataFrame contract.
-
-        Breeze caps intraday ranges, so intraday windows are fetched in
-        chunks (5-day for 1-minute, 30-day for 5/30-minute) and merged.
+    def get_option_chain(
+        self,
+        symbol: str,
+        exchange: str,
+        expiry_date,
+        right: str = "",
+        strike_price: str = "",
+    ):
         """
-        try:
-            if interval not in self.timeframe_map:
-                raise Exception(
-                    f"Unsupported interval '{interval}' for ICICI Direct. "
-                    f"Supported: {', '.join(self.timeframe_map.keys())}"
-                )
+        Raw Breeze option-chain response (Success = contract rows with
+        greeks/iv per strike).
+        """
 
-            params = get_breeze_params(symbol, exchange)
-            breeze_interval = self.timeframe_map[interval]
-            # The v1 endpoint expects minute/day spellings (see the SDK).
-            body_interval = {"1minute": "minute", "1day": "day"}.get(breeze_interval, breeze_interval)
-            is_daily = body_interval == "day"
+        params = _quote_instrument(symbol, exchange)
 
-            if isinstance(start_date, str):
-                start = datetime.strptime(start_date, "%Y-%m-%d")
-            else:
-                start = datetime.combine(start_date, datetime.min.time())
-            if isinstance(end_date, str):
-                end = datetime.strptime(end_date, "%Y-%m-%d")
-            else:
-                end = datetime.combine(end_date, datetime.min.time())
+        if not params.get("stock_code"):
+            raise ICICIBreezeAPIError(
+                f"Cannot resolve stock code for {symbol} on {exchange}"
+            )
 
-            frames = []
-            if is_daily:
-                frames.append(
-                    self._history_chunk(
-                        params,
-                        "day",
-                        start.strftime("%Y-%m-%dT00:00:00.000Z"),
-                        end.strftime("%Y-%m-%dT23:59:59.000Z"),
-                    )
+        params["product_type"] = "options"
+
+        if expiry_date:
+            if isinstance(expiry_date, (datetime, pd.Timestamp)):
+                params["expiry_date"] = pd.Timestamp(expiry_date).strftime(
+                    "%Y-%m-%dT06:00:00.000Z"
                 )
             else:
-                chunk_days = 5 if body_interval == "minute" else 30
-                cursor = start
-                while cursor <= end:
-                    chunk_end = min(cursor + timedelta(days=chunk_days), end)
-                    frames.append(
-                        self._history_chunk(
-                            params,
-                            body_interval,
-                            cursor.strftime("%Y-%m-%dT03:45:00.000Z"),
-                            chunk_end.strftime("%Y-%m-%dT10:00:00.000Z"),
-                        )
-                    )
-                    cursor = chunk_end + timedelta(days=1)
+                params["expiry_date"] = str(expiry_date)
 
-            df = pd.concat([f for f in frames if not f.empty], ignore_index=True) if any(
-                not f.empty for f in frames
-            ) else self._empty_history()
+        if right:
+            params["right"] = str(right).lower()
 
-            if df.empty:
-                return self._empty_history()
+        if strike_price not in ("", None):
+            params["strike_price"] = str(strike_price)
 
-            df = df.drop_duplicates(subset="timestamp", keep="last")
-            df = df.sort_values("timestamp").reset_index(drop=True)
-            return df
+        response = breeze_request(
+            self.auth_token,
+            "GET",
+            "optionchain",
+            params,
+        )
 
-        except BrokerBusyError:
-            raise
-        except Exception as e:
-            logger.error(f"Error fetching Breeze history for {symbol}/{exchange}: {e}")
-            raise Exception(f"Error fetching historical data: {str(e)}") from e
+        if not isinstance(response, dict):
+            raise ICICIBreezeAPIError("Invalid option-chain response")
 
-    def get_quotes(self, symbol, exchange):
-        """Latest quote in the shared quotes contract (raises on API error)."""
-        try:
-            params, body = self._quotes_payload(symbol, exchange)
+        return response
 
-            _apply_rate_limit("quote")
-            data = request_raw(
-                "quotes", self.auth_token, "GET", json.dumps(body, separators=(",", ":"))
-            )[1]
+    # ------------------------------------------------------------------
+    # Misc
+    # ------------------------------------------------------------------
 
-            if not is_success(data):
-                error = data.get("Error") if isinstance(data, dict) else str(data)
-                raise Exception(f"Error fetching quotes: {error or 'unknown error'}")
-
-            row = self._extract_quote_row(data, params["exchange_code"])
-            if row is None:
-                return {
-                    "ltp": 0.0,
-                    "open": 0.0,
-                    "high": 0.0,
-                    "low": 0.0,
-                    "volume": 0,
-                    "oi": 0,
-                    "bid": 0.0,
-                    "ask": 0.0,
-                    "prev_close": 0.0,
-                }
-
-            return {
-                "ltp": _num(row.get("ltp")),
-                "open": _num(row.get("open")),
-                "high": _num(row.get("high")),
-                "low": _num(row.get("low")),
-                "volume": int(_num(row.get("total_quantity_traded") or row.get("volumn") or row.get("volume"))),
-                "oi": int(_num(row.get("oi") or row.get("open_interest"))),
-                "bid": _num(row.get("best_bid_price")),
-                "ask": _num(row.get("best_offer_price")),
-                "prev_close": _num(row.get("previous_close")),
-            }
-
-        except BrokerBusyError:
-            raise
-        except Exception as e:
-            logger.error(f"Error fetching Breeze quotes for {symbol}/{exchange}: {e}")
-            raise Exception(f"Error fetching quotes: {str(e)}") from e
-
-    def get_multiquotes(self, symbols):
-        """Sequential quotes for a symbol list (Breeze has no batch endpoint).
-
-        Returns one entry per symbol: {symbol, exchange, data:{...}} on
-        success or {symbol, exchange, error} on failure.
-        """
-        results = []
-        for item in symbols or []:
-            symbol = item.get("symbol")
-            exchange = item.get("exchange")
-            try:
-                quote = self.get_quotes(symbol, exchange)
-                results.append({"symbol": symbol, "exchange": exchange, "data": quote})
-            except BrokerBusyError:
-                raise
-            except Exception as e:
-                results.append({"symbol": symbol, "exchange": exchange, "error": str(e)})
-        return results
-
-    def get_depth(self, symbol, exchange):
-        """Top-of-book depth padded to five levels (Breeze REST has one level)."""
-        try:
-            params, body = self._quotes_payload(symbol, exchange)
-
-            _apply_rate_limit("quote")
-            data = request_raw(
-                "quotes", self.auth_token, "GET", json.dumps(body, separators=(",", ":"))
-            )[1]
-
-            if not is_success(data):
-                error = data.get("Error") if isinstance(data, dict) else str(data)
-                raise Exception(f"Error fetching depth: {error or 'unknown error'}")
-
-            row = self._extract_quote_row(data, params["exchange_code"])
-            if row is None:
-                raise Exception(f"No depth data returned for {symbol} on {exchange}")
-
-            bids = [
-                {
-                    "price": _num(row.get("best_bid_price")),
-                    "quantity": int(_num(row.get("best_bid_quantity"))),
-                }
-            ]
-            asks = [
-                {
-                    "price": _num(row.get("best_offer_price")),
-                    "quantity": int(_num(row.get("best_offer_quantity"))),
-                }
-            ]
-            while len(bids) < 5:
-                bids.append({"price": 0.0, "quantity": 0})
-            while len(asks) < 5:
-                asks.append({"price": 0.0, "quantity": 0})
-
-            return {
-                "bids": bids,
-                "asks": asks,
-                "ltp": _num(row.get("ltp")),
-                "ltq": int(_num(row.get("ltq"))),
-                "volume": int(_num(row.get("total_quantity_traded") or row.get("volumn") or row.get("volume"))),
-                "open": _num(row.get("open")),
-                "high": _num(row.get("high")),
-                "low": _num(row.get("low")),
-                "prev_close": _num(row.get("previous_close")),
-                "oi": int(_num(row.get("oi") or row.get("open_interest"))),
-                "totalbuyqty": int(_num(row.get("best_bid_quantity"))),
-                "totalsellqty": int(_num(row.get("best_offer_quantity"))),
-            }
-
-        except BrokerBusyError:
-            raise
-        except Exception as e:
-            logger.error(f"Error fetching Breeze depth for {symbol}/{exchange}: {e}")
-            raise Exception(f"Error fetching market depth: {str(e)}") from e
-
+    def get_supported_intervals(self) -> list:
+        return sorted(self.timeframe_map.keys())

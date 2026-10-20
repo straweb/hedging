@@ -136,6 +136,7 @@ def get_quotes_with_auth(
             # Fallback to just auth token if we can't inspect
             data_handler = broker_module.BrokerData(auth_token)
 
+        logger.info("get_quotes %s:%s", exchange, symbol)
         quotes = data_handler.get_quotes(symbol, exchange)
 
         if quotes is None:

@@ -1,568 +1,448 @@
-# broker/icici/streaming/icici_adapter.py
-# Live-feed adapter for the ICICI Direct Breeze API.
-#
-# Breeze streams over python-socket.io (engine.io over websocket) rather than
-# a raw WebSocket, so this adapter drives socketio.Client instead of the
-# websocket-client WebSocketApp the other OpenAlgo adapters use. The wire
-# contract comes from the official Breeze SDK:
-#
-#   - connect to https://livestream.icicidirect.com with
-#     auth={"user": <icici user id>, "token": <session key>}
-#   - join a room with emit("join", "<prefix>.<type>!<token>") and receive
-#     "stock" events carrying a CSV-style list of fields
-#   - re-join every room on socket reconnect (the SDK's rewatch pattern)
-#
-# The "stock" payload layouts (verified against the SDK parser):
-#   quotes (type 1), NSE/BSE  21 fields: open@1 last@2 high@3 low@4 change@5
-#                             bid@6 bidQty@7 ask@8 askQty@9 ltq@10 avg@11
-#                             ttq@12 buyQty@13 sellQty@14 ttv@15 ... ltt@19 close@20
-#   quotes (type 1), F&O      23 fields: ... OI@12 CHNGOI@13 ttq@14 ... ltt@21 close@22
-#   depth  (type 2)                      time@1, 5-level ladder @2
-#   MCX    (prefix 6)         22 base fields: volume@1 ttq@4 last@5 ltq@6
-#                             ltt@7 avg@8 buy@9 sell@10 close@12 open@13
-#                             high@14 low@15 OI@17, ladder from 22
-#   index  (prefix 3)                    open@1 high@2 low@3 prevClose@4
-#                             ltp@5 ltq@6 ltt@7 volume@8 pct@9 abs@10 ...
-#                             bid@12 bidQty@13 ask@14 askQty@15 oi@16
+"""
+ICICI Direct Breeze streaming adapter -> OpenAlgo unified feed.
 
-import json
-import os
-import sys
-import threading
-import time
+Subclasses ``websocket_proxy.base_adapter.BaseBrokerWebSocketAdapter`` and
+publishes normalized ticks on the shared ZeroMQ bus with topics
+``f"{exchange}_{symbol}_{MODE}"`` (MODE in LTP / QUOTE / DEPTH).
+
+Subscription model
+------------------
+Breeze's Socket.IO stream joins per-token rooms. The adapter resolves the
+OpenAlgo symbol to the ICICI token via the master contract
+(``database.token_db.get_token``) and the websocket wrapper subscribes the
+matching feed rooms (``"4.1!<token>"`` quotes, ``"4.2!<token>"`` depth).
+
+Auth: the streaming client is built from the stored ICICI auth JSON
+(api_session + user_id/session_key); the SDK owns the Socket.IO handshake.
+"""
+
 from typing import Any
 
-import socketio
-
 from database.auth_db import get_auth_token
-from database.token_db import get_br_symbol, get_symbol, get_token
-from utils.logging import get_logger
-
-sys.path.append(os.path.join(os.path.dirname(__file__), "../../../"))
-
+from database.token_db import get_token
 from websocket_proxy.base_adapter import BaseBrokerWebSocketAdapter
-from websocket_proxy.mapping import SymbolMapper
 
-from broker.icici.api.breeze_client import decode_session_token
-from broker.icici.streaming.icici_mapping import (
-    IciciCapabilityRegistry,
-    IciciExchangeMapper,
-)
-from broker.icici.api.baseurl import LIVE_STREAM_URL
+from broker.icici.api.breeze_client import get_breeze_client
+from broker.icici.streaming.icici_mapping import map_tick
+from broker.icici.streaming.icici_websocket import IciciWebSocket
+from utils.logging import get_logger
+from utils.runtime import is_monkey_patched
+
 
 logger = get_logger(__name__)
 
-# Import the real threading module even when the Flask process is
-# monkey-patched by eventlet - the proxy subprocess runs unpatched, but the
-# adapter module may be imported from either context (zerodha pattern).
-from utils import runtime as _runtime
 
-_real_threading = _runtime.original("threading")
+if is_monkey_patched("thread"):
+    from utils.runtime import original as _original
 
-
-def _num(value, default=0.0):
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
+    _real_threading = _original("threading")
+else:
+    import threading as _real_threading
 
 
-def _int(value, default=0):
-    try:
-        return int(float(value))
-    except (TypeError, ValueError):
-        return default
+# OpenAlgo numeric modes
+MODE_LTP = 1
+MODE_QUOTE = 2
+MODE_DEPTH = 3
+
+_MODE_TOPIC = {
+    MODE_LTP: "LTP",
+    MODE_QUOTE: "QUOTE",
+    MODE_DEPTH: "DEPTH",
+}
 
 
 class IciciWebSocketAdapter(BaseBrokerWebSocketAdapter):
-    """ICICI Direct live market data adapter (socket.io transport)."""
+    """ICICI Direct Breeze market-data adapter for OpenAlgo."""
 
     def __init__(self):
         super().__init__()
 
         self.broker_name = "icici"
-        self.user_id = None
-        self.session_key = None
 
-        self.sio = None
-        self.connected = False
+        self.user_id: str | None = None
+
+        self.auth_token: str | None = None
+
+        self.breeze = None
+
+        self.ws_client: IciciWebSocket | None = None
+
         self.running = False
-        self._disconnected = False
+        self.connected = False
 
-        # correlation id -> subscription metadata (source of truth for replay)
-        self.subscriptions = {}
-        # livestream room -> (symbol, exchange, mode)
-        self.token_map = {}
+        # (exchange, token) -> {"symbol": ..., "mode": highest}
+        self.token_info: dict[tuple[str, str], dict] = {}
 
-        self.lock = _real_threading.Lock()
+        self.lock = _real_threading.RLock()
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
+        self.logger = logger
 
-    def initialize(self, broker_name, user_id, auth_data=None):
-        """Resolve the Breeze session (user_id + session_key) for the feed."""
-        self.broker_name = broker_name or "icici"
-        self.user_id = user_id
+    # ==================================================================
+    # INITIALIZATION
+    # ==================================================================
 
-        if auth_data:
-            auth_token = auth_data.get("auth_token") or ""
-        else:
-            auth_token = get_auth_token(user_id) or ""
+    def initialize(
+        self,
+        broker_name=None,
+        user_id=None,
+        auth_data=None,
+        *args,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """
+        Initialize the adapter with the stored ICICI session.
 
-        if not auth_token:
-            raise ValueError(
-                f"No ICICI Direct session token found for user {user_id}. Please re-authenticate."
-            )
-
-        try:
-            feed_user_id, session_key = decode_session_token(auth_token)
-        except (ValueError, UnicodeDecodeError) as e:
-            raise ValueError(f"Malformed ICICI Direct session token for user {user_id}: {e}")
-
-        # The socket.io auth needs the ICICI user id, which may differ from
-        # the OpenAlgo username in the auth table's name column.
-        self.user_id = feed_user_id
-        self.session_key = session_key
-
-        self.running = True
-        self._disconnected = False
-        logger.info("ICICI Direct adapter initialized for user feed")
-
-    def connect(self):
-        """Open the socket.io market-data connection."""
-        if not self.session_key:
-            return {
-                "status": "error",
-                "code": "AUTH_ERROR",
-                "message": "Adapter not initialized. Call initialize() first.",
-            }
-
-        if self.sio is None:
-            self.sio = socketio.Client(
-                reconnection=True,
-                reconnection_attempts=0,  # infinite; disconnect() stops it
-                reconnection_delay=2,
-                reconnection_delay_max=30,
-                logger=False,
-                engineio_logger=False,
-            )
-            self.sio.on("connect", self._on_connect)
-            self.sio.on("disconnect", self._on_socket_disconnect)
-            self.sio.on("stock", self._on_stock)
-            self.sio.on("connect_error", self._on_connect_error)
+        ``auth_data`` accepts {"token": <auth json>} (the websocket proxy
+        contract) or {"auth_token": ...} / {"access_token": ...}.
+        """
 
         try:
-            self.sio.connect(
-                LIVE_STREAM_URL,
-                auth={"user": self.user_id, "token": self.session_key},
-                transports="websocket",
-                wait_timeout=10,
+            if broker_name:
+                self.broker_name = broker_name
+
+            self.user_id = user_id
+
+            auth_token = ""
+
+            if isinstance(auth_data, dict):
+                auth_token = (
+                    auth_data.get("token")
+                    or auth_data.get("auth_token")
+                    or auth_data.get("access_token")
+                    or ""
+                )
+
+            if not auth_token:
+                auth_token = get_auth_token(user_id) or ""
+
+            if not auth_token:
+                return {
+                    "status": "error",
+                    "message": (
+                        "No ICICI authentication token available for "
+                        f"user {user_id}"
+                    ),
+                }
+
+            self.auth_token = auth_token
+
+            # Authenticated SDK client (session exchange + security
+            # master for token rooms). Cached process-wide.
+            self.breeze = get_breeze_client(auth_token)
+
+            self.ws_client = IciciWebSocket(
+                breeze=self.breeze,
+                on_message_callback=self._on_message,
+                on_error_callback=self._on_error,
+                on_close_callback=self._on_close,
+                on_open_callback=self._on_open,
             )
-            # on('connect') fires within connect() and sets self.connected.
+
+            self.logger.info(
+                "ICICI adapter initialized for user %s", user_id
+            )
+
             return {
                 "status": "success",
-                "message": "Connected to ICICI Direct live stream"
-                if self.connected
-                else "ICICI Direct live stream connection pending",
+                "message": "Adapter initialized successfully",
             }
-        except Exception as e:
-            logger.error(f"ICICI Direct live stream connect failed: {e}")
-            return {"status": "error", "code": "CONNECTION_ERROR", "message": str(e)}
 
-    def disconnect(self):
-        """Disconnect and release resources (idempotent)."""
-        if self._disconnected:
-            return
-        self._disconnected = True
-        self.running = False
-        self.connected = False
+        except Exception as exc:
+            self.logger.error("Error initializing ICICI adapter: %s", exc)
 
-        if self.sio is not None:
-            try:
-                if self.sio.connected:
-                    self.sio.emit("disconnect", "transport close")
-                self.sio.disconnect()
-            except Exception as e:
-                logger.warning(f"Error while disconnecting ICICI stream: {e}")
-            self.sio = None
+            return {"status": "error", "message": str(exc)}
 
-        self.subscriptions = {}
-        self.token_map = {}
-        self.cleanup_zmq()
+    # ==================================================================
+    # LIFECYCLE
+    # ==================================================================
 
-    # ------------------------------------------------------------------
-    # Socket.io handlers
-    # ------------------------------------------------------------------
-
-    def _on_connect(self):
-        """(Re)connection callback - replay every room from subscriptions."""
-        self.connected = True
-        logger.info("Connected to ICICI Direct live stream")
-
-        with self.lock:
-            channels = list({sub["channel"] for sub in self.subscriptions.values()})
-
-        for channel in channels:
-            try:
-                self.sio.emit("join", channel)
-            except Exception as e:
-                logger.error(f"Failed to rejoin room {channel}: {e}")
-        if channels:
-            logger.info(f"Rejoined {len(channels)} ICICI stream room(s) after connect")
-
-    def _on_socket_disconnect(self, *args):
-        self.connected = False
-        logger.info("ICICI Direct live stream disconnected; auto-reconnect is active")
-
-    def _on_connect_error(self, data=None):
-        self.connected = False
-        logger.error(f"ICICI Direct live stream connect error: {data}")
-
-    # ------------------------------------------------------------------
-    # Subscription API
-    # ------------------------------------------------------------------
-
-    def subscribe(self, symbol, exchange, mode=2, depth_level=5):
-        """Subscribe a symbol; returns the shared proxy response contract."""
-        if not IciciCapabilityRegistry.is_mode_supported(mode):
-            return self._create_error_response(
-                "INVALID_MODE", f"Invalid mode {mode}. Must be 1 (LTP), 2 (Quote), or 3 (Depth)"
-            )
-        if mode == 3 and not IciciCapabilityRegistry.is_depth_level_supported(depth_level):
-            return self._create_error_response(
-                "INVALID_DEPTH", f"Invalid depth level {depth_level}. ICICI Direct supports 5 levels"
-            )
-
-        token_info = SymbolMapper.get_token_from_symbol(symbol, exchange)
-        if not token_info:
-            return self._create_error_response(
-                "SYMBOL_NOT_FOUND", f"Symbol {symbol} not found for exchange {exchange}"
-            )
-
-        token = str(token_info["token"])
-        brexchange = token_info["brexchange"]
-
-        # Index spot quotes ride the dedicated prefix-3 rooms, which only the
-        # OpenAlgo exchange argument can identify (index rows store the
-        # venue's own brexchange, NSE/BSE).
-        if exchange in ("NSE_INDEX", "BSE_INDEX"):
-            prefix = "3"
-        else:
-            prefix = IciciExchangeMapper.get_prefix(brexchange)
-        channel_type = "2" if mode == 3 else "1"
-        channel = f"{prefix}.{channel_type}!{token}"
-        correlation_id = f"{symbol}_{exchange}_{mode}"
-
-        with self.lock:
-            self.subscriptions[correlation_id] = {
-                "symbol": symbol,
-                "exchange": exchange,
-                "brexchange": brexchange,
-                "token": token,
-                "mode": mode,
-                "depth_level": depth_level,
-                "channel": channel,
+    def connect(self) -> dict[str, Any]:
+        if not self.ws_client:
+            return {
+                "status": "error",
+                "message": "WebSocket client not initialized",
             }
-            self.token_map[channel] = (symbol, exchange, mode)
 
-        if self.connected and self.sio is not None:
-            try:
-                self.sio.emit("join", channel)
-            except Exception as e:
-                logger.error(f"Failed to join room {channel}: {e}")
-                return self._create_error_response("SUBSCRIPTION_ERROR", str(e))
-
-        return self._create_success_response(
-            f"Subscribed to {symbol}.{exchange}",
-            symbol=symbol,
-            exchange=exchange,
-            mode=mode,
-            depth_level=depth_level,
-        )
-
-    def unsubscribe(self, symbol, exchange, mode=2):
-        """Unsubscribe a symbol; emits leave for its room."""
-        token_info = SymbolMapper.get_token_from_symbol(symbol, exchange)
-        if not token_info:
-            return self._create_error_response(
-                "SYMBOL_NOT_FOUND", f"Symbol {symbol} not found for exchange {exchange}"
-            )
-
-        token = str(token_info["token"])
-        brexchange = token_info["brexchange"]
-        if exchange in ("NSE_INDEX", "BSE_INDEX"):
-            prefix = "3"
-        else:
-            prefix = IciciExchangeMapper.get_prefix(brexchange)
-        channel_type = "2" if mode == 3 else "1"
-        channel = f"{prefix}.{channel_type}!{token}"
-        correlation_id = f"{symbol}_{exchange}_{mode}"
-
-        with self.lock:
-            if correlation_id not in self.subscriptions:
-                return self._create_error_response(
-                    "NOT_SUBSCRIBED", f"Not subscribed to {symbol}.{exchange}"
-                )
-            del self.subscriptions[correlation_id]
-            # Only leave the room when no other subscription still uses it.
-            if not any(sub["channel"] == channel for sub in self.subscriptions.values()):
-                self.token_map.pop(channel, None)
-                still_needed = False
-            else:
-                still_needed = True
-
-        if not still_needed and self.connected and self.sio is not None:
-            try:
-                self.sio.emit("leave", channel)
-            except Exception as e:
-                logger.error(f"Failed to leave room {channel}: {e}")
-                return self._create_error_response("UNSUBSCRIPTION_ERROR", str(e))
-
-        return self._create_success_response(
-            f"Unsubscribed from {symbol}.{exchange}",
-            symbol=symbol,
-            exchange=exchange,
-            mode=mode,
-        )
-
-    # ------------------------------------------------------------------
-    # Tick parsing / publishing
-    # ------------------------------------------------------------------
-
-    def _on_stock(self, data):
-        """'stock' event: a CSV-style list whose first field is the room id."""
         try:
-            if not isinstance(data, (list, tuple)) or not data:
-                return
+            with self.lock:
+                if self.running and self.connected:
+                    return {
+                        "status": "success",
+                        "message": "Already connected",
+                    }
 
-            room = str(data[0])
-            if "!" not in room:
-                # ICICI streams unframed payloads for some index rooms; the
-                # room cannot be resolved, so the tick is dropped safely.
-                logger.debug(f"Dropping unframed ICICI tick: {data[:4]}")
-                return
+                if self.ws_client.start():
+                    self.running = True
 
-            lookup = self.token_map.get(room)
-            if lookup is None:
-                # Depth rooms ("4.2!x") and quote rooms ("4.1!x") map
-                # separately; also try the sibling channel type.
-                logger.debug(f"Received tick for untracked room {room}")
-                return
+                    if self.ws_client.wait_for_connection(timeout=15.0):
+                        self.connected = True
 
-            symbol, exchange, mode = lookup
-            prefix = room.split("!")[0].split(".")[0]
-            channel_type = room.split("!")[0].split(".")[1]
+                        self.logger.info("ICICI stream connected")
 
-            if prefix == "6":
-                market_data = self._normalize_mcx(data)
-            elif prefix == "3":
-                market_data = self._normalize_index(data)
-            elif channel_type == "2":
-                market_data = self._normalize_depth(data)
-            else:
-                market_data = self._normalize_quotes(data)
+                        return {
+                            "status": "success",
+                            "message": "Connected successfully",
+                        }
 
-            if not market_data:
-                return
+                    if self.ws_client.running:
+                        self.logger.warning(
+                            "ICICI stream client started but connection "
+                            "not confirmed yet"
+                        )
 
-            mode_name = {1: "LTP", 2: "QUOTE", 3: "DEPTH"}.get(mode, "QUOTE")
-            topic = f"{exchange}_{symbol}_{mode_name}"
-            market_data.update(
-                {
-                    "symbol": symbol,
-                    "exchange": exchange,
-                    "mode": mode,
-                    "timestamp": int(time.time() * 1000),
+                        return {
+                            "status": "success",
+                            "message": "Client started, connection in progress",
+                        }
+
+                    return {
+                        "status": "error",
+                        "message": "Connection timeout",
+                    }
+
+                return {
+                    "status": "error",
+                    "message": "Failed to start ICICI stream client",
                 }
-            )
-            self.publish_market_data(topic, market_data)
 
-        except Exception as e:
-            logger.error(f"Error processing ICICI tick: {e}", exc_info=True)
+        except Exception as exc:
+            self.logger.exception("ICICI adapter connect failed")
 
-    @staticmethod
-    def _ladder(ladder_rows, bse_style=False, bfo_style=False):
-        """Depth ladder rows -> {buy:[], sell:[]} in the shared shape."""
-        buy, sell = [], []
-        for level in ladder_rows or []:
-            if bse_style:
-                # [buyRate, buyQty, sellRate, sellQty]
-                buy.append({"price": _num(level[0]), "quantity": _int(level[1]), "orders": 0})
-                sell.append({"price": _num(level[2]), "quantity": _int(level[3]), "orders": 0})
-            elif bfo_style:
-                # [buyRate, buyQty, buyOrders, sellRate, sellQty, sellOrders]
-                buy.append({"price": _num(level[0]), "quantity": _int(level[1]), "orders": _int(level[2])})
-                sell.append({"price": _num(level[3]), "quantity": _int(level[4]), "orders": _int(level[5])})
-            else:
-                # [buyRate, buyQty, buyOrders, buyFlag, sellRate, sellQty, sellOrders, sellFlag]
-                buy.append({"price": _num(level[0]), "quantity": _int(level[1]), "orders": _int(level[2])})
-                sell.append({"price": _num(level[4]), "quantity": _int(level[5]), "orders": _int(level[6])})
-        return {"buy": buy, "sell": sell}
+            return {"status": "error", "message": str(exc)}
 
-    def _normalize_quotes(self, data):
-        """Standard quotes layout (prefixes 1/4/8/13)."""
+    def disconnect(self) -> dict[str, Any]:
         try:
-            length = len(data)
-            open_, last, high, low = _num(data[1]), _num(data[2]), _num(data[3]), _num(data[4])
-            change = _num(data[5])
-            if length >= 23:
-                # F&O layout: OI@12 CHNGOI@13 ttq@14 buyQty@15 sellQty@16
-                # ttv@17 ... ltt@21 close@22
-                oi, oi_change = _int(data[12]), _int(data[13])
-                ttq = _int(data[14])
-                total_buy = _int(data[15])
-                total_sell = _int(data[16])
-                ltt = _int(data[21], 0)
-                close = _num(data[22])
-            elif length >= 21:
-                # NSE/BSE layout: ttq@12 buyQty@13 sellQty@14 ttv@15 ...
-                # ltt@19 close@20
-                oi, oi_change = 0, 0
-                ttq = _int(data[12])
-                total_buy = _int(data[13])
-                total_sell = _int(data[14])
-                ltt = _int(data[19], 0)
-                close = _num(data[20])
-            else:
-                close = 0.0
-                oi = oi_change = ttq = total_buy = total_sell = 0
-                ltt = 0
+            with self.lock:
+                if self.ws_client:
+                    self.ws_client.stop()
+                    self.ws_client = None
 
-            prev_close = close if close > 0 else (last - change if last else 0.0)
-            change_percent = (change / prev_close * 100) if prev_close else 0.0
+                self.running = False
+                self.connected = False
 
-            result = {
-                "ltp": round(last, 2),
-                "ltt": ltt,
-                "volume": ttq,
-                "open": round(open_, 2),
-                "high": round(high, 2),
-                "low": round(low, 2),
-                "close": round(close, 2),
-                "last_trade_quantity": _int(data[10]),
-                "average_price": round(_num(data[11]), 2),
-                "total_buy_quantity": total_buy,
-                "total_sell_quantity": total_sell,
-                "change_absolute": round(change, 2),
-                "change_percent": round(change_percent, 2),
-            }
-            if oi:
-                result["oi"] = oi
-                result["oi_change"] = oi_change
-            return result
-        except (IndexError, TypeError, ValueError) as e:
-            logger.debug(f"Malformed ICICI quotes payload: {e}")
-            return {}
+                self.token_info.clear()
 
-    def _normalize_depth(self, data):
-        """Depth layout: room@0, time@1, ladder@2."""
-        try:
-            ladder = data[2]
-            if not isinstance(ladder, (list, tuple)):
-                return {}
+                self.logger.info("ICICI stream disconnected")
 
-            prefix = str(data[0]).split("!")[0].split(".")[0]
-            bse_style = prefix == "1"
-            bfo_style = prefix == "8"
-            depth = self._ladder(ladder, bse_style=bse_style, bfo_style=bfo_style)
+                self.cleanup_zmq()
 
-            result = {
-                "ltp": _num(depth["buy"][0]["price"]) if depth["buy"] else 0.0,
-                "ltt": _int(data[1], 0),
-                "volume": 0,
-                "open": 0.0,
-                "high": 0.0,
-                "low": 0.0,
-                "close": 0.0,
-                "last_quantity": 0,
-                "average_price": 0.0,
-                "total_buy_quantity": sum(l["quantity"] for l in depth["buy"]),
-                "total_sell_quantity": sum(l["quantity"] for l in depth["sell"]),
-                "change_absolute": 0.0,
-                "change_percent": 0.0,
-                "depth": depth,
-            }
-            return result
-        except (IndexError, TypeError, ValueError) as e:
-            logger.debug(f"Malformed ICICI depth payload: {e}")
-            return {}
-
-    def _normalize_mcx(self, data):
-        """MCX layout: volume@1 ttq@4 last@5 ltq@6 ltt@7 avg@8 buy@9 sell@10
-        close@12 open@13 high@14 low@15 OI@17, ladder from 22."""
-        try:
-            if len(data) < 18:
-                return {}
-            close, open_, high, low = _num(data[12]), _num(data[13]), _num(data[14]), _num(data[15])
-            last = _num(data[5])
-            change = last - close if close else 0.0
-            change_percent = (change / close * 100) if close else 0.0
-
-            result = {
-                "ltp": round(last, 2),
-                "ltt": _int(data[7], 0),
-                "volume": _int(data[4]),
-                "open": round(open_, 2),
-                "high": round(high, 2),
-                "low": round(low, 2),
-                "close": round(close, 2),
-                "last_trade_quantity": _int(data[6]),
-                "average_price": round(_num(data[8]), 2),
-                "total_buy_quantity": _int(data[9]),
-                "total_sell_quantity": _int(data[10]),
-                "change_absolute": round(change, 2),
-                "change_percent": round(change_percent, 2),
-                "oi": _int(data[17]),
+            return {
+                "status": "success",
+                "message": "Disconnected successfully and resources cleaned up",
             }
 
-            if len(data) > 22 and isinstance(data[22], (list, tuple)):
-                result["depth"] = self._ladder(data[22])
-            return result
-        except (IndexError, TypeError, ValueError) as e:
-            logger.debug(f"Malformed ICICI MCX payload: {e}")
-            return {}
+        except Exception as exc:
+            self.logger.exception("Error disconnecting ICICI adapter")
 
-    def _normalize_index(self, data):
-        """Index layout (prefix 3): open@1 high@2 low@3 prevClose@4 ltp@5
-        ltq@6 ltt@7 volume@8 pct@9 abs@10 ... bid@12 bidQty@13 ask@14
-        askQty@15 oi@16."""
+            try:
+                self.cleanup_zmq()
+            except Exception:
+                pass
+
+            return {"status": "error", "message": str(exc)}
+
+    # ==================================================================
+    # SUBSCRIPTIONS
+    # ==================================================================
+
+    def subscribe(
+        self,
+        symbol: str,
+        exchange: str,
+        mode: int = MODE_QUOTE,
+        depth_level: int = 5,
+    ) -> dict[str, Any]:
+        if not self.ws_client:
+            return {
+                "status": "error",
+                "message": "WebSocket client not initialized",
+            }
+
         try:
-            if len(data) < 16:
-                return {}
-            prev_close = _num(data[4])
-            last = _num(data[5])
-            change = _num(data[10]) if len(data) > 10 else 0.0
-            change_percent = _num(data[9]) if len(data) > 9 else (
-                (change / prev_close * 100) if prev_close else 0.0
+            token = get_token(symbol, exchange)
+
+            if not token:
+                return {
+                    "status": "error",
+                    "error_code": 404,
+                    "message": (
+                        f"Token not found for {symbol} on {exchange}. "
+                        "Load the ICICI master contract and retry."
+                    ),
+                }
+
+            result = self.ws_client.subscribe(
+                symbol=symbol,
+                exchange=exchange,
+                token=str(token),
+                mode=int(mode),
             )
 
-            result = {
-                "ltp": round(last, 2),
-                "ltt": _int(data[7], 0),
-                "volume": _int(data[8]),
-                "open": round(_num(data[1]), 2),
-                "high": round(_num(data[2]), 2),
-                "low": round(_num(data[3]), 2),
-                "close": round(prev_close, 2),
-                "last_trade_quantity": _int(data[6]),
-                "average_price": 0.0,
-                "total_buy_quantity": _int(data[13]),
-                "total_sell_quantity": _int(data[15]),
-                "change_absolute": round(change, 2),
-                "change_percent": round(change_percent, 2),
+            if result.get("status") != "success":
+                return result
+
+            with self.lock:
+                entry = self.token_info.get((exchange, str(token)))
+
+                if entry:
+                    entry["mode"] = max(entry["mode"], int(mode))
+                else:
+                    self.token_info[(exchange, str(token))] = {
+                        "symbol": symbol,
+                        "mode": int(mode),
+                    }
+
+            return self._create_success_response(
+                f"Subscribed {symbol} ({exchange})",
+                symbol=symbol,
+                exchange=exchange,
+                mode=int(mode),
+                depth_level=5,
+                actual_depth=5,
+            )
+
+        except Exception as exc:
+            self.logger.exception("ICICI subscribe failed for %s", symbol)
+
+            return {"status": "error", "message": str(exc)}
+
+    def unsubscribe(
+        self,
+        symbol: str,
+        exchange: str,
+        mode: int = MODE_QUOTE,
+    ) -> dict[str, Any]:
+        if not self.ws_client:
+            return {
+                "status": "error",
+                "message": "WebSocket client not initialized",
             }
-            if len(data) > 16:
-                result["oi"] = _int(data[16])
+
+        try:
+            token = get_token(symbol, exchange)
+
+            if not token:
+                return self._create_error_response(
+                    "TOKEN_NOT_FOUND",
+                    f"Token not found for {symbol} on {exchange}",
+                )
+
+            result = self.ws_client.unsubscribe(
+                symbol=symbol,
+                exchange=exchange,
+                token=str(token),
+                mode=int(mode),
+            )
+
+            with self.lock:
+                self.token_info.pop((exchange, str(token)), None)
+
             return result
-        except (IndexError, TypeError, ValueError) as e:
-            logger.debug(f"Malformed ICICI index payload: {e}")
-            return {}
 
-    # ------------------------------------------------------------------
-    # Introspection helpers (used by tests)
-    # ------------------------------------------------------------------
+        except Exception as exc:
+            self.logger.exception(
+                "ICICI unsubscribe failed for %s", symbol
+            )
 
-    def get_subscriptions_snapshot(self):
-        with self.lock:
-            return json.loads(json.dumps(self.subscriptions))
+            return {"status": "error", "message": str(exc)}
+
+    # ==================================================================
+    # STREAM EVENTS
+    # ==================================================================
+
+    def _on_open(self) -> None:
+        self.connected = True
+
+        self.logger.info("ICICI stream opened")
+
+    def _on_close(self) -> None:
+        self.connected = False
+
+        self.logger.info("ICICI stream closed")
+
+    def _on_error(self, error) -> None:
+        self.connected = False
+
+        self.logger.error("ICICI stream error: %s", error)
+
+    def _on_message(self, message) -> None:
+        """
+        One parsed Breeze tick. Resolves the room token back to the
+        OpenAlgo subscription and publishes on the ZeroMQ bus.
+        """
+
+        if not isinstance(message, dict):
+            return
+
+        feed_token = str(message.get("symbol") or "")
+
+        if not feed_token or "!" not in feed_token:
+            # Order notifications / heartbeats carry no feed token.
+            return
+
+        if not self.ws_client:
+            return
+
+        subscription, raw_token = self.ws_client.resolve_feed_token(
+            feed_token
+        )
+
+        if not subscription:
+            return
+
+        symbol = subscription["symbol"]
+        exchange = subscription["exchange"]
+        mode = int(subscription.get("mode") or MODE_QUOTE)
+
+        try:
+            tick = map_tick(
+                message,
+                symbol=symbol,
+                exchange=exchange,
+                token=raw_token,
+                mode=mode,
+            )
+
+        except Exception:
+            self.logger.exception("Tick mapping failed for %s", feed_token)
+
+            return
+
+        if not tick:
+            return
+
+        # ----------------------------------------------------------
+        # Publish per mode (topic: exchange_symbol_MODE)
+        # ----------------------------------------------------------
+        if mode == MODE_LTP:
+            self._publish(symbol, exchange, MODE_LTP, tick)
+            return
+
+        if mode == MODE_DEPTH:
+            self._publish(symbol, exchange, MODE_DEPTH, tick)
+
+            if "last_price" in tick and tick.get("last_price"):
+                self._publish(symbol, exchange, MODE_QUOTE, tick)
+
+            return
+
+        self._publish(symbol, exchange, MODE_QUOTE, tick)
+
+    def _publish(self, symbol: str, exchange: str, mode: int, tick: dict) -> None:
+        try:
+            topic = f"{exchange}_{symbol}_{_MODE_TOPIC[mode]}"
+
+            self.publish_market_data(topic, tick)
+
+        except Exception:
+            self.logger.exception(
+                "Failed to publish tick for %s:%s", exchange, symbol
+            )
+
+    # ==================================================================
+    # COMPATIBILITY
+    # ==================================================================
+
+    def get_supported_depth_levels(self) -> list[int]:
+        return [5]

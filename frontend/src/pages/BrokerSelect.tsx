@@ -221,7 +221,7 @@ export default function BrokerSelect() {
         // ICICI Direct Breeze hosted login; the backend builds the login URL
         // from the configured app key and returns the api_session on the
         // registered /icici/callback redirect.
-        loginUrl = `/icici/callback`
+        loginUrl = `https://api.icicidirect.com/apiuser/login?api_key=${broker_api_key}`
         break
       
       case 'paytm':

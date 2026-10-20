@@ -95,7 +95,10 @@ _BROKER_FACTORIES: dict[str, tuple[str, str]] = {
 # updates onto the market-data socket instead is not viable either: that adapter
 # runs in the websocket_proxy *subprocess* under gunicorn+eventlet and Docker, so
 # the OrderUpdateEvent would be published on the wrong process's event bus.
-_POLLING_BROKERS = {"groww", "fivepaisa", "samco"}
+# icici: Breeze order notifications arrive on a Socket.IO stream that is
+# bound to the market-feed session (breeze-connect client), so the
+# REST-polling fallback is the reliable path — same reasoning as samco.
+_POLLING_BROKERS = {"groww", "fivepaisa", "samco", "icici"}
 
 # user_id -> live adapter (BaseOrderUpdateAdapter or PollingOrderUpdateAdapter)
 _ADAPTERS: dict[str, object] = {}

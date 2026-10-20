@@ -1,176 +1,360 @@
-# broker/icici/mapping/order_data.py
-# Book mapping for the ICICI Direct (Breeze) plugin.
-#
-# Breeze book rows identify instruments by (exchange_code, stock_code,
-# product_type, expiry_date, right, strike_price) and carry no numeric token,
-# so every row is resolved back to the OpenAlgo symbol through the symtoken
-# table on the fields that make a contract unique.
+"""
+ICICI Direct Breeze -> OpenAlgo account-data mappings.
 
-import threading
+Exposed hooks used by OpenAlgo services:
 
-from broker.icici.mapping.transform_data import (
-    BREEZE_INDEX_TO_OPENALGO,
-    format_strike,
-    map_exchange,
-    reverse_map_product_type,
-    to_oa_expiry,
-)
-from database.symbol import SymToken
+    map_order_data(order_data=...)          transform_order_data(...)
+    map_trade_data(trade_data=...)          transform_tradebook_data(...)
+    map_position_data(position_data=...)    transform_positions_data(...)
+    map_holding_data(holding_data=...)      transform_holdings_data(...)
+    calculate_order_statistics(...)         calculate_portfolio_statistics(...)
+
+Breeze wraps every response as {"Success": ..., "Status": ..., "Error": ...};
+the REST layer in breeze_client.py has already normalised empty books to an
+empty Success list before the data reaches this module.
+"""
+
+from database.token_db import get_oa_symbol
 from utils.logging import get_logger
+
 
 logger = get_logger(__name__)
 
-# Breeze order/position statuses -> OpenAlgo normalized statuses.
-STATUS_COMPLETE = {"executed"}
-STATUS_OPEN = {"ordered", "queued", "requested", "partially executed"}
-STATUS_REJECTED = {"rejected"}
-STATUS_CANCELLED = {
-    "cancelled",
-    "expired",
-    "freezed",
-    "partially executed and expired",
-    "partially executed and cancelled",
-}
 
-_resolver_lock = threading.Lock()
-_resolver_cache = {}
-_RESOLVER_CACHE_MAX = 8192
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _rows(data) -> list:
+    if data is None:
+        return []
+
+    if isinstance(data, list):
+        return data
+
+    if isinstance(data, dict):
+        if isinstance(data.get("data"), list):
+            return data["data"]
+
+        success = data.get("Success")
+
+        if success is None:
+            return []
+
+        if isinstance(success, list):
+            return success
+
+        if isinstance(success, dict):
+            return [success]
+
+    return []
 
 
-def _resolve_symbol(exchange_code, stock_code, expiry_date, strike_price, right):
-    """Resolve a Breeze instrument quintuple to an OpenAlgo symbol.
+def _get(data: dict, *keys, default=None):
+    for key in keys:
+        if key in data:
+            value = data[key]
 
-    Returns (symbol, instrumenttype) or (None, None). Equity rows resolve on
-    (brexchange, brsymbol); derivatives additionally pin expiry, strike and
-    right so two contracts of the same underlying cannot collapse into one.
-    """
-    oa_exchange = map_exchange(exchange_code)
-    cache_key = (oa_exchange, exchange_code, stock_code, expiry_date or "", strike_price or "", right or "")
-    with _resolver_lock:
-        cached = _resolver_cache.get(cache_key)
-    if cached is not None:
-        return cached
+            if value is not None and value != "":
+                return value
 
-    symbol = None
-    instrumenttype = None
+    return default
+
+
+def _string(value, default=""):
+    if value is None:
+        return default
+
+    return str(value)
+
+
+def _int(value, default=0):
     try:
-        query = SymToken.query.filter_by(brexchange=exchange_code, brsymbol=stock_code)
-        row = None
-        if expiry_date:
-            # Derivative: pin every identity field the row carries.
-            expiry = to_oa_expiry(expiry_date)
-            rows = query.filter_by(expiry=expiry).all() if expiry else query.all()
-            strike = format_strike(strike_price)
-            if right and right.lower() in ("call", "put"):
-                wanted_type = "CE" if right.lower() == "call" else "PE"
-                for candidate in rows:
-                    if (
-                        candidate.instrumenttype == wanted_type
-                        and format_strike(candidate.strike) == strike
-                    ):
-                        row = candidate
-                        break
-            else:
-                for candidate in rows:
-                    if candidate.instrumenttype == "FUT":
-                        row = candidate
-                        break
-        else:
-            row = query.first()
-        if row is not None:
-            symbol = row.symbol
-            instrumenttype = (row.instrumenttype or "EQ").upper()
-    except Exception as e:
-        # Mapping must never take down a book render; the caller falls back
-        # to the raw broker symbol.
-        logger.warning(f"Breeze symbol resolution failed for {stock_code}/{exchange_code}: {e}")
+        if value is None or value == "":
+            return default
 
-    result = (symbol, instrumenttype)
-    with _resolver_lock:
-        if len(_resolver_cache) >= _RESOLVER_CACHE_MAX:
-            _resolver_cache.clear()
-        _resolver_cache[cache_key] = result
+        return int(float(value))
+
+    except (TypeError, ValueError):
+        return default
+
+
+def _float(value, default=0.0):
+    try:
+        if value is None or value == "":
+            return default
+
+        return float(value)
+
+    except (TypeError, ValueError):
+        return default
+
+
+def _exchange(value) -> str:
+    value = _string(value).upper()
+
+    mapping = {
+        "NFO": "NFO",
+        "BFO": "BFO",
+        "MCX": "MCX",
+        "NSE": "NSE",
+        "BSE": "BSE",
+        "CDS": "CDS",
+        "NDX": "CDS",
+    }
+
+    return mapping.get(value, value)
+
+
+def _action(value) -> str:
+    value = _string(value).upper()
+
+    if value in ("B", "BUY"):
+        return "BUY"
+
+    if value in ("S", "SELL"):
+        return "SELL"
+
+    return value
+
+
+def _product(value, exchange="") -> str:
+    """
+    Breeze product -> OpenAlgo product.
+
+    Breeze reports the *instrument* product (Cash/Futures/Options/Margin)
+    rather than the order product, so derivatives collapse to NRML and
+    cash-margin to MIS.
+    """
+
+    value = _string(value).lower()
+
+    exchange = _string(exchange).upper()
+
+    if exchange in ("NFO", "BFO", "MCX"):
+        return "NRML"
+
+    mapping = {
+        "cash": "CNC",
+        "delivery": "CNC",
+        "margin": "MIS",
+        "mis": "MIS",
+        "btst": "CNC",
+        "mtf": "NRML",
+    }
+
+    return mapping.get(value, "MIS")
+
+
+def _price_type(value) -> str:
+    value = _string(value).upper()
+
+    mapping = {
+        "LIMIT": "LIMIT",
+        "MARKET": "MARKET",
+        "STOPLOSS": "SL",
+        "STOP LOSS": "SL",
+        "STOPLIMIT": "SL",
+        "SL": "SL",
+        "SL-M": "SL-M",
+        "STOPLOSS_MARKET": "SL-M",
+    }
+
+    return mapping.get(value, value or "LIMIT")
+
+
+def _status(value) -> str:
+    """
+    Breeze status -> OpenAlgo lowercase vocabulary.
+
+    Unmapped intermediates collapse to 'open' per the common contract.
+    """
+
+    value = _string(value).strip().upper()
+
+    mapping = {
+        "REQUESTED": "open",
+        "ORDERED": "open",
+        "QUEUED": "open",
+        "ACCEPTED": "open",
+        "OPEN": "open",
+        "PENDING": "open",
+        "VALIDATION PENDING": "open",
+        "PUT ORDER REQ RECEIVED": "open",
+        "MODIFY VALIDATION PENDING": "open",
+        "FREEZE": "open",
+
+        "EXECUTED": "complete",
+        "COMPLETED": "complete",
+        "TRADED": "complete",
+        "COMPLETE": "complete",
+        "FILLED": "complete",
+
+        "PARTIALLY EXECUTED": "partial",
+        "PARTIALLY EXECUTED AND EXPIRED": "partial",
+        "PARTIALLY EXECUTED AND CANCELLED": "partial",
+        "PARTIALLY FILLED": "partial",
+
+        "CANCELED": "cancelled",
+        "CANCELLED": "cancelled",
+
+        "REJECTED": "rejected",
+        "REJECT": "rejected",
+
+        "EXPIRED": "expired",
+    }
+
+    return mapping.get(value, value.lower() or "open")
+
+
+def _order_status(order: dict) -> str:
+    status = _status(
+        _get(order, "status", "order_status", "orderStatus")
+    )
+
+    # A terminal broker status wins outright — ICICI can still report
+    # cancelled_quantity on an executed order (partial cancel + partial
+    # fill).
+    if status in ("complete", "cancelled", "rejected", "expired"):
+        return status
+
+    pending_quantity = _int(_get(order, "pending_quantity", "open_quantity"))
+
+    cancelled_quantity = _int(_get(order, "cancelled_quantity"))
+
+    quantity = _int(_get(order, "quantity", "order_quantity"))
+
+    # A pending-labelled order whose entire quantity was cancelled must
+    # never surface as open.
+    if (
+        status == "open"
+        and cancelled_quantity > 0
+        and pending_quantity == 0
+        and quantity <= cancelled_quantity
+    ):
+        return "cancelled"
+
+    return status
+
+
+def _timestamp(*keys, row=None) -> str:
+    value = _get(row or {}, *keys, default="")
+
+    return _string(value)
+
+
+def _oa_symbol(brsymbol: str, exchange: str) -> str:
+    try:
+        return get_oa_symbol(brsymbol=brsymbol, exchange=exchange) or brsymbol
+    except Exception:
+        return brsymbol
+
+
+# ---------------------------------------------------------------------------
+# Order book
+# ---------------------------------------------------------------------------
+
+def map_order_data(order_data) -> list[dict]:
+    result = []
+
+    for order in _rows(order_data):
+        if not isinstance(order, dict):
+            continue
+
+        exchange = _exchange(
+            _get(order, "exchange_code", "exchange")
+        )
+
+        brsymbol = _string(
+            _get(order, "stock_code", "trading_symbol", "tradingsymbol", "symbol")
+        )
+
+        result.append(
+            {
+                "orderid": _string(_get(order, "order_id", "orderid")),
+                "exchangeorderid": _string(
+                    _get(order, "exchange_order_id", "exchangeorderid")
+                ),
+                "symbol": _oa_symbol(brsymbol, exchange),
+                "exchange": exchange,
+                "action": _action(_get(order, "action", "transaction_type", "orderFlow")),
+                "quantity": _int(_get(order, "quantity", "order_quantity", "orderTotalQuantity")),
+                "pending_quantity": _int(
+                    _get(order, "pending_quantity", "open_quantity")
+                ),
+                "cancelled_quantity": _int(
+                    _get(order, "cancelled_quantity", "cancelledQuantity")
+                ),
+                "price": _float(_get(order, "price", "limit_price", "orderLimitRate", "limitRate")),
+                "average_price": _float(
+                    _get(
+                        order,
+                        "average_price",
+                        "average_executed_rate",
+                        "averageExecutedRate",
+                        "averagePrice",
+                    )
+                ),
+                "trigger_price": _float(
+                    _get(order, "stoploss", "trigger_price", "stopLossTrigger", "stoploss")
+                ),
+                "pricetype": _price_type(
+                    _get(order, "order_type", "pricetype", "limitMarketFlag")
+                ),
+                "product": _product(
+                    _get(order, "product_type", "product", "productType"),
+                    exchange,
+                ),
+                "order_status": _order_status(order),
+                "validity": _string(_get(order, "validity", "orderType"), "DAY"),
+                "disclosed_quantity": _int(_get(order, "disclosed_quantity")),
+                "timestamp": _timestamp(
+                    "order_datetime",
+                    "order_time",
+                    "messageDate",
+                    "orderDate",
+                    row=order,
+                ),
+                "rejection_reason": _string(
+                    _get(order, "message", "rejection_reason", "orderMessageCharacter")
+                ),
+            }
+        )
+
     return result
 
 
-def _derive_instrumenttype(row):
-    """Instrument type for a Breeze row that did not resolve to a DB row."""
-    right = (row.get("right") or "").lower()
-    if right in ("call", "put"):
-        return "CE" if right == "call" else "PE"
-    if row.get("expiry_date") or row.get("expiryDate"):
-        return "FUT"
-    return "EQ"
+def transform_order_data(order_data):
+    return map_order_data(order_data)
 
 
-def map_order_data(order_data):
-    """Annotate Breeze order/trade/position rows with OpenAlgo identity.
-
-    Writes tradingSymbol (OpenAlgo symbol), exchangeSegment (OpenAlgo
-    exchange) and productType (OpenAlgo product) onto every row, matching the
-    field names the shared book services expect.
-    """
-    if not order_data:
-        return order_data if isinstance(order_data, list) else []
-
-    for row in order_data:
-        if not isinstance(row, dict):
-            continue
-
-        exchange_code = row.get("exchange_code") or row.get("exchangeSegment") or ""
-        stock_code = row.get("stock_code") or ""
-        expiry_date = row.get("expiry_date") or ""
-        strike_price = row.get("strike_price") or ""
-        right = row.get("right") or ""
-
-        symbol, instrumenttype = _resolve_symbol(
-            exchange_code, stock_code, expiry_date, strike_price, right
-        )
-        if not symbol:
-            # Underlying-level fallback for unresolved derivatives (stale
-            # master contract), mirroring dhan's never-null rule (#1463).
-            symbol = BREEZE_INDEX_TO_OPENALGO.get(stock_code, stock_code)
-            instrumenttype = _derive_instrumenttype(row)
-            logger.warning(
-                f"Breeze symbol not resolved for {stock_code}/{exchange_code}; "
-                f"falling back to '{symbol}'"
-            )
-
-        oa_exchange = map_exchange(exchange_code)
-        row["tradingSymbol"] = symbol
-        row["exchangeSegment"] = oa_exchange
-        row["productType"] = reverse_map_product_type(
-            row.get("product_type") or row.get("productType") or "", instrumenttype
-        ) or row.get("product_type") or "MIS"
-
-    return order_data
+def transform_orderbook_data(order_data):
+    return map_order_data(order_data)
 
 
-def calculate_order_statistics(order_data):
-    """Order-book statistics; normalizes each row's orderStatus in place."""
-    total_buy_orders = total_sell_orders = 0
-    total_completed_orders = total_open_orders = total_rejected_orders = 0
+def calculate_order_statistics(order_data) -> dict:
+    total_buy_orders = 0
+    total_sell_orders = 0
+    total_completed_orders = 0
+    total_open_orders = 0
+    total_rejected_orders = 0
 
-    if order_data:
-        for order in order_data:
-            action = (order.get("action") or "").lower()
-            if action == "buy":
-                total_buy_orders += 1
-            elif action == "sell":
-                total_sell_orders += 1
+    for order in order_data or []:
+        action = str(order.get("action") or "").upper()
 
-            status = (order.get("status") or "").lower()
-            if status in STATUS_COMPLETE:
-                total_completed_orders += 1
-                order["orderStatus"] = "complete"
-            elif status in STATUS_OPEN:
-                total_open_orders += 1
-                order["orderStatus"] = "open"
-            elif status in STATUS_REJECTED:
-                total_rejected_orders += 1
-                order["orderStatus"] = "rejected"
-            elif status in STATUS_CANCELLED:
-                order["orderStatus"] = "cancelled"
+        if action == "BUY":
+            total_buy_orders += 1
+        elif action == "SELL":
+            total_sell_orders += 1
+
+        status = str(order.get("order_status") or order.get("status") or "").lower()
+
+        if status == "complete":
+            total_completed_orders += 1
+        elif status in ("open", "trigger pending", "partial"):
+            total_open_orders += 1
+        elif status == "rejected":
+            total_rejected_orders += 1
 
     return {
         "total_buy_orders": total_buy_orders,
@@ -181,246 +365,237 @@ def calculate_order_statistics(order_data):
     }
 
 
-def _map_pricetype(order_type):
-    """Breeze order_type ("Limit"/"Market"/"StopLoss") -> OpenAlgo pricetype."""
-    ot = (order_type or "").lower()
-    if ot == "limit":
-        return "LIMIT"
-    if ot == "market":
-        return "MARKET"
-    if ot == "stoploss":
-        return "SL"
-    return (order_type or "").upper()
+# ---------------------------------------------------------------------------
+# Trade book
+# ---------------------------------------------------------------------------
 
+def map_trade_data(trade_data) -> list[dict]:
+    result = []
 
-def transform_order_data(orders):
-    """Breeze order rows -> the normalized orderbook row contract."""
-    if isinstance(orders, dict):
-        orders = [orders]
-
-    transformed_orders = []
-    for order in orders or []:
-        if not isinstance(order, dict):
-            logger.warning(f"Expected a dict order row, found {type(order)}; skipping")
-            continue
-
-        transformed_orders.append(
-            {
-                "symbol": order.get("tradingSymbol", ""),
-                "exchange": order.get("exchangeSegment", ""),
-                "action": (order.get("action") or "").upper(),
-                "quantity": order.get("quantity", 0),
-                "price": order.get("price", 0.0),
-                "trigger_price": order.get("stoploss", 0.0) or 0.0,
-                "pricetype": _map_pricetype(order.get("order_type", "")),
-                "product": order.get("productType", ""),
-                "orderid": order.get("order_id", ""),
-                "order_status": order.get("orderStatus", ""),
-                "timestamp": order.get("order_datetime", ""),
-            }
-        )
-    return transformed_orders
-
-
-def map_trade_data(trade_data):
-    return map_order_data(trade_data)
-
-
-def transform_tradebook_data(tradebook_data):
-    """Breeze trade rows -> normalized tradebook rows.
-
-    Breeze's trade payload spells fields differently across API versions, so
-    numeric fields read through candidate keys instead of assuming one shape.
-    """
-    transformed_data = []
-    for trade in tradebook_data or []:
+    for trade in _rows(trade_data):
         if not isinstance(trade, dict):
             continue
 
-        quantity = trade.get("quantity") or trade.get("trade_quanity") or trade.get("traded_quantity") or 0
-        price = (
-            trade.get("trade_price")
-            or trade.get("average_trade_price")
-            or trade.get("average_price")
-            or trade.get("price")
-            or 0.0
-        )
-        try:
-            quantity = float(quantity)
-            price = float(price)
-        except (TypeError, ValueError):
-            quantity, price = 0.0, 0.0
+        exchange = _exchange(_get(trade, "exchange_code", "exchange"))
 
-        transformed_data.append(
+        brsymbol = _string(
+            _get(trade, "stock_code", "trading_symbol", "tradingsymbol", "symbol")
+        )
+
+        quantity = _int(_get(trade, "quantity", "traded_quantity", "executed_quantity"))
+
+        price = _float(
+            _get(
+                trade,
+                "average_cost",
+                "average_price",
+                "average_executed_rate",
+                "trade_price",
+                "price",
+            )
+        )
+
+        result.append(
             {
-                "symbol": trade.get("tradingSymbol", ""),
-                "exchange": trade.get("exchangeSegment", ""),
-                "product": trade.get("productType", ""),
-                "action": (trade.get("action") or "").upper(),
+                "tradeid": _string(_get(trade, "trade_id", "tradeid", "exchange_trade_id")),
+                "orderid": _string(_get(trade, "order_id", "orderid", "orderReference")),
+                "symbol": _oa_symbol(brsymbol, exchange),
+                "exchange": exchange,
+                "product": _product(
+                    _get(trade, "product_type", "product"), exchange
+                ),
+                "action": _action(_get(trade, "action", "transaction_type", "orderFlow")),
                 "quantity": quantity,
                 "average_price": price,
                 "trade_value": round(quantity * price, 2),
-                "orderid": trade.get("order_id", ""),
-                "timestamp": trade.get("trade_date") or trade.get("trade_datetime") or "",
+                "timestamp": _timestamp(
+                    "trade_datetime",
+                    "trade_time",
+                    "trade_date",
+                    "order_datetime",
+                    row=trade,
+                ),
             }
         )
-    return transformed_data
+
+    return result
 
 
-def map_position_data(position_data):
-    return map_order_data(position_data)
+def transform_tradebook_data(trade_data):
+    return map_trade_data(trade_data)
 
 
-def transform_positions_data(positions_data):
-    """Breeze position rows -> normalized position rows.
+# ---------------------------------------------------------------------------
+# Positions
+# ---------------------------------------------------------------------------
 
-    Breeze reports ltp directly, so no multiquotes round-trip is needed. pnl
-    may be null on freshly opened positions; it is then derived from
-    (ltp - average_price) * quantity.
-    """
-    transformed_data = []
-    for position in positions_data or []:
+def map_position_data(position_data) -> list[dict]:
+    result = []
+
+    for position in _rows(position_data):
         if not isinstance(position, dict):
             continue
 
-        symbol = position.get("tradingSymbol") or ""
-        exchange = position.get("exchangeSegment") or ""
+        exchange = _exchange(_get(position, "exchange_code", "exchange"))
 
-        try:
-            quantity = float(position.get("quantity", 0) or 0)
-        except (TypeError, ValueError):
-            quantity = 0.0
-        try:
-            average_price = float(position.get("average_price", 0) or 0)
-        except (TypeError, ValueError):
-            average_price = 0.0
-        try:
-            ltp = float(position.get("ltp", 0) or 0)
-        except (TypeError, ValueError):
-            ltp = 0.0
-        try:
-            pnl = position.get("pnl")
-            if pnl is None or pnl == "":
-                raise TypeError
-            pnl = float(pnl)
-        except (TypeError, ValueError):
-            # Breeze leaves pnl null on freshly opened positions; derive it.
-            pnl = (ltp - average_price) * quantity if (ltp and average_price) else 0.0
+        brsymbol = _string(
+            _get(position, "stock_code", "trading_symbol", "tradingsymbol", "symbol")
+        )
 
-        transformed_data.append(
+        net_quantity = _int(
+            _get(
+                position,
+                "quantity",
+                "net_quantity",
+                "open_quantity",
+                "cover_quantity",
+            )
+        )
+
+        buy_quantity = _int(_get(position, "buy_quantity", "buy_qty", "credit_quantity"))
+        sell_quantity = _int(_get(position, "sell_quantity", "sell_qty", "debit_quantity"))
+
+        if net_quantity == 0 and (buy_quantity or sell_quantity):
+            net_quantity = buy_quantity - sell_quantity
+
+        ltp = _float(
+            _get(position, "ltp", "last_price", "last_traded_price", "market_price")
+        )
+
+        average_price = _float(
+            _get(
+                position,
+                "average_price",
+                "avg_price",
+                "buy_avg_rate",
+                "average_cost",
+            )
+        )
+
+        pnl = _float(
+            _get(
+                position,
+                "pnl",
+                "profit_n_loss",
+                "unrealised",
+                "mtm",
+            ),
+            default=round((ltp - average_price) * net_quantity, 2)
+            if net_quantity and average_price
+            else 0.0,
+        )
+
+        result.append(
             {
-                "symbol": symbol,
+                "symbol": _oa_symbol(brsymbol, exchange),
                 "exchange": exchange,
-                "product": position.get("productType") or "",
-                "quantity": quantity,
-                "average_price": round(average_price, 2),
-                "ltp": round(ltp, 2),
-                "pnl": round(pnl, 2),
+                "product": _product(
+                    _get(position, "product_type", "product"), exchange
+                ),
+                "quantity": net_quantity,
+                "pnl": pnl,
+                "average_price": average_price,
+                "ltp": ltp,
             }
         )
-    return transformed_data
+
+    return result
 
 
-def map_portfolio_data(portfolio_data):
-    """Resolve and enrich Breeze holding rows.
+def transform_positions_data(position_data):
+    return map_position_data(position_data)
 
-    Enrichment writes the same private fields the dhan-style downstream
-    statistics consume: _oa_symbol, _exchange and _ltp. Breeze reports
-    current_market_price on every holding, so the enrichment is fully local
-    and needs no multiquotes round-trip.
-    """
-    if portfolio_data is None or not isinstance(portfolio_data, list):
-        logger.info("No holdings data available.")
-        return {}
 
-    for h in portfolio_data:
-        if not isinstance(h, dict):
+# ---------------------------------------------------------------------------
+# Holdings
+# ---------------------------------------------------------------------------
+
+def map_holding_data(holding_data) -> list[dict]:
+    result = []
+
+    for holding in _rows(holding_data):
+        if not isinstance(holding, dict):
             continue
-        symbol, _ = _resolve_symbol(
-            h.get("exchange_code") or "NSE",
-            h.get("stock_code") or "",
-            h.get("expiry_date") or "",
-            h.get("strike_price") or "",
-            h.get("right") or "",
+
+        exchange = _exchange(_get(holding, "exchange_code", "exchange") or "NSE")
+
+        brsymbol = _string(
+            _get(holding, "stock_code", "trading_symbol", "tradingsymbol", "symbol")
         )
-        h["_oa_symbol"] = symbol or h.get("stock_code") or ""
-        h["_exchange"] = map_exchange(h.get("exchange_code") or "NSE")
-        try:
-            h["_ltp"] = float(h.get("current_market_price", 0) or 0)
-        except (TypeError, ValueError):
-            h["_ltp"] = 0.0
 
-    return portfolio_data
+        quantity = _int(
+            _get(holding, "quantity", "demat_quantity", "holdings_quantity")
+        )
 
+        average_price = _float(
+            _get(
+                holding,
+                "average_price",
+                "buy_avg",
+                "average_cost",
+                "purchase_price",
+            )
+        )
 
-def calculate_portfolio_statistics(holdings_data):
-    if not holdings_data:
-        return {
-            "totalholdingvalue": 0,
-            "totalinvvalue": 0,
-            "totalprofitandloss": 0,
-            "totalpnlpercentage": 0,
-        }
+        ltp = _float(
+            _get(holding, "ltp", "last_price", "last_traded_price", "market_price")
+        )
 
-    def _num(value):
-        try:
-            return float(value or 0)
-        except (TypeError, ValueError):
-            return 0.0
+        pnl = _float(
+            _get(holding, "pnl", "profit_n_loss", "unrealised"),
+            default=round((ltp - average_price) * quantity, 2)
+            if quantity and average_price
+            else 0.0,
+        )
 
-    totalinvvalue = sum(
-        _num(h.get("average_price")) * _num(h.get("quantity")) for h in holdings_data
-    )
-    # Prefer the enriched LTP; fall back to average cost so the value starts
-    # at investment (zero P&L) rather than zero.
-    totalholdingvalue = sum(
-        (_num(h.get("_ltp")) or _num(h.get("average_price"))) * _num(h.get("quantity"))
-        for h in holdings_data
-    )
-    totalprofitandloss = totalholdingvalue - totalinvvalue
-    totalpnlpercentage = (totalprofitandloss / totalinvvalue * 100) if totalinvvalue else 0
-    return {
-        "totalholdingvalue": totalholdingvalue,
-        "totalinvvalue": totalinvvalue,
-        "totalprofitandloss": totalprofitandloss,
-        "totalpnlpercentage": totalpnlpercentage,
-    }
+        pnlpercent = (
+            round((pnl / (average_price * quantity)) * 100, 2)
+            if quantity and average_price
+            else 0.0
+        )
 
-
-def transform_holdings_data(holdings_data):
-    transformed_data = []
-    if not holdings_data:
-        return transformed_data
-
-    def _num(value):
-        try:
-            return float(value or 0)
-        except (TypeError, ValueError):
-            return 0.0
-
-    for h in holdings_data:
-        if not isinstance(h, dict):
-            continue
-        qty = _num(h.get("quantity"))
-        avg = _num(h.get("average_price"))
-        ltp = _num(h.get("_ltp"))
-        if ltp > 0 and avg > 0:
-            pnl = round((ltp - avg) * qty, 2)
-            pnlpercent = round((ltp - avg) / avg * 100, 2)
-        else:
-            pnl = round(_num(h.get("unrealized_profit")), 2)
-            pnlpercent = 0.0
-
-        transformed_data.append(
+        result.append(
             {
-                "symbol": h.get("_oa_symbol") or "",
-                "exchange": h.get("_exchange") or "NSE",
-                "quantity": qty,
+                "symbol": _oa_symbol(brsymbol, exchange),
+                "exchange": exchange,
+                "quantity": quantity,
                 "product": "CNC",
-                "average_price": round(avg, 2),
-                "ltp": round(ltp, 2),
+                "average_price": average_price,
                 "pnl": pnl,
                 "pnlpercent": pnlpercent,
             }
         )
-    return transformed_data
+
+    return result
+
+
+def transform_holdings_data(holding_data):
+    return map_holding_data(holding_data)
+
+
+def calculate_portfolio_statistics(holdings_data) -> dict:
+    totalholdingvalue = 0.0
+    totalinvvalue = 0.0
+    totalprofitandloss = 0.0
+
+    for holding in holdings_data or []:
+        quantity = _int(holding.get("quantity"))
+        average_price = _float(holding.get("average_price"))
+        ltp = _float(holding.get("ltp"))
+
+        totalholdingvalue += ltp * quantity
+        totalinvvalue += average_price * quantity
+        totalprofitandloss += _float(holding.get("pnl"))
+
+    totalpnlpercentage = (
+        round((totalprofitandloss / totalinvvalue) * 100, 2)
+        if totalinvvalue
+        else 0.0
+    )
+
+    return {
+        "totalholdingvalue": round(totalholdingvalue, 2),
+        "totalinvvalue": round(totalinvvalue, 2),
+        "totalprofitandloss": round(totalprofitandloss, 2),
+        "totalpnlpercentage": totalpnlpercentage,
+    }

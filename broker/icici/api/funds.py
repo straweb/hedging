@@ -1,89 +1,94 @@
-# api/funds.py
-# Funds for the ICICI Direct Breeze API.
+"""
+ICICI Direct Breeze funds API for OpenAlgo.
+"""
 
-import json
-
-from broker.icici.api.breeze_client import extract_error, is_success, request_raw
-from broker.icici.api.order_api import get_positions
+from broker.icici.api.breeze_client import breeze_request, response_status
 from utils.logging import get_logger
+
 
 logger = get_logger(__name__)
 
-ZERO_MARGIN = {
-    "availablecash": "0.00",
-    "collateral": "0.00",
-    "m2munrealized": "0.00",
-    "m2mrealized": "0.00",
-    "utiliseddebits": "0.00",
-}
 
+def _as_float(value, default=0.0) -> float:
+    if value is None:
+        return default
 
-def _num(value):
+    if isinstance(value, bool):
+        return float(value)
+
     try:
-        return float(value or 0)
+        if isinstance(value, str):
+            value = value.strip().replace(",", "")
+
+            if not value:
+                return default
+
+        return float(value)
+
     except (TypeError, ValueError):
-        return 0.0
+        return default
 
 
-def test_auth_token(auth_token):
-    """Validate the stored session token with a lightweight funds call.
-
-    Returns (True, None) or (False, error_message). Required by the auth
-    session-resume path in blueprints/auth.py.
+def get_margin_data(auth_token) -> dict:
     """
+    Return ICICI Direct funds in the OpenAlgo funds format:
+
+        {availablecash, collateral, m2munrealized, m2mrealized,
+         utiliseddebits}  (all 2-dp strings; {} on error)
+    """
+
+    if not auth_token:
+        return {}
+
     try:
-        data = request_raw("funds", auth_token, "GET", "{}")[1]
-        if is_success(data):
-            return True, None
-        return False, extract_error(data) or "ICICI Direct session token is invalid or expired"
-    except Exception as e:
-        logger.error(f"Error testing Breeze auth token: {e}")
-        return False, f"Error validating authentication: {str(e)}"
+        response = breeze_request(auth_token, "GET", "funds", {})
 
+        if response_status(response) != 200:
+            logger.error(
+                "ICICI funds request failed: %s", response.get("Error")
+            )
 
-def get_margin_data(auth_token):
-    """Funds summary in the shared five-key string format."""
-    try:
-        data = request_raw("funds", auth_token, "GET", "{}")[1]
+            return {}
 
-        if not is_success(data):
-            logger.error(f"Error fetching Breeze funds: {extract_error(data)}")
-            return dict(ZERO_MARGIN)
+        success = response.get("Success")
 
-        funds = data.get("Success") or {}
+        if isinstance(success, list):
+            success = success[0] if success else {}
 
-        # Breeze funds payload: unallocated_balance is the free cash,
-        # block_by_trade_* are the per-segment utilised amounts. There is no
-        # collateral or M2M split in the payload.
-        available_cash = _num(funds.get("unallocated_balance"))
-        utilised = (
-            _num(funds.get("block_by_trade_equity"))
-            + _num(funds.get("block_by_trade_fno"))
-            + _num(funds.get("block_by_trade_commodity"))
-            + _num(funds.get("block_by_trade_currency"))
+        if not isinstance(success, dict):
+            success = {}
+
+        total_bank = _as_float(success.get("total_bank_balance"))
+        allocated_equity = _as_float(success.get("allocated_equity"))
+        allocated_commodity = _as_float(
+            success.get("allocated_commodity")
+        )
+        allocated_fno = _as_float(success.get("allocated_fno"))
+        block_by_trade = _as_float(success.get("block_by_trade_balance"))
+        unallocated = _as_float(success.get("unallocated_balance"))
+
+        # Available cash = what the equity segment can deploy right now.
+        availablecash = (
+            allocated_equity
+            + unallocated
+            + total_bank
+            - block_by_trade
         )
 
-        # Unrealized M2M from the live positions, summed where reported.
-        total_unrealized = 0.0
-        try:
-            positions = get_positions(auth_token)
-            if isinstance(positions, list):
-                for position in positions:
-                    pnl = position.get("pnl")
-                    if pnl is not None:
-                        total_unrealized += _num(pnl)
-        except Exception as e:
-            logger.warning(f"Could not enrich funds with position M2M: {e}")
+        utilised = allocated_fno + allocated_commodity + block_by_trade
+
+        if availablecash < 0:
+            availablecash = 0.0
 
         return {
-            "availablecash": f"{available_cash:.2f}",
+            "availablecash": f"{availablecash:.2f}",
             "collateral": "0.00",
-            "m2munrealized": f"{total_unrealized:.2f}",
+            "m2munrealized": "0.00",
             "m2mrealized": "0.00",
             "utiliseddebits": f"{utilised:.2f}",
         }
-    except KeyError:
+
+    except Exception:
+        logger.exception("Error fetching ICICI funds")
+
         return {}
-    except Exception as e:
-        logger.error(f"Error fetching Breeze margin data: {e}")
-        return dict(ZERO_MARGIN)
